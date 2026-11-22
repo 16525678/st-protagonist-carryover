@@ -76,17 +76,31 @@ function getLocalForage() {
   return null;
 }
 
+export function isMobileViewport() {
+  try {
+    if (typeof window === 'undefined') return false;
+    if (typeof window.matchMedia === 'function') {
+      if (window.matchMedia('(max-width: 768px)').matches) return true;
+    }
+    return Number(window.innerWidth || 0) > 0 && Number(window.innerWidth) <= 768;
+  } catch {
+    return false;
+  }
+}
+
 export function getHostRuntimeSummary() {
   const isTT = isTauriTavernHost();
+  const isMobile = isMobileViewport();
   const hasTtStore = Boolean(getTauriTavernStore());
   const hasLf = Boolean(getLocalForage());
   return {
     isTauriTavern: isTT,
-    hostLabel: isTT ? 'TauriTavern (Tauri/WebView)' : 'SillyTavern (浏览器)',
+    isMobile,
+    hostLabel: `${isTT ? 'TauriTavern' : 'SillyTavern'} · ${isMobile ? '手机端' : '桌面端'}`,
     storageLabel: hasTtStore
-      ? 'TauriTavern 原生 extension.store'
+      ? 'TT原生存储'
       : hasLf
-        ? 'IndexedDB (localforage)'
+        ? 'IndexedDB'
         : 'extensionSettings',
   };
 }
@@ -280,4 +294,33 @@ export function triggerJsonDownload(filename, jsonString) {
   link.click();
   document.body.removeChild(link);
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** 手机端 WebView 友好的剪贴板复制（优先 navigator.clipboard，失败降级 textarea 选中复制） */
+export async function copyTextToClipboard(text) {
+  const str = String(text ?? '');
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(str);
+      return true;
+    }
+  } catch {
+    // 降级到传统选区复制（部分 Android/iOS WebView 限制 clipboard API）
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = str;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.top = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, str.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return Boolean(ok);
+  } catch {
+    return false;
+  }
 }

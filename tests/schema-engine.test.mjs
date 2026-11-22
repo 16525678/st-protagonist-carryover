@@ -537,6 +537,13 @@ test('11. TauriTavern 宿主检测与原生 extension.store 读写优先级及�
   assert.equal(isTauriTavernHost(), true);
   assert.match(getHostRuntimeSummary().hostLabel, /TauriTavern/);
 
+  // 模拟手机窄屏视口检测
+  globalThis.window = { innerWidth: 390 };
+  assert.match(getHostRuntimeSummary().hostLabel, /手机端/);
+  globalThis.window = { innerWidth: 1440 };
+  assert.match(getHostRuntimeSummary().hostLabel, /桌面端/);
+  delete globalThis.window;
+
   const mockCtx = { extensionSettings: {}, saveSettingsDebounced: () => {} };
   const sample = [createProtagonistProfile({ name: 'TT主角', tables: [] })];
   const writeRes = await saveProfiles(mockCtx, sample);

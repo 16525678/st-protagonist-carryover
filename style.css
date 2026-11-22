@@ -1,4 +1,9 @@
-/* 主角跨聊天传承插件样式 — 针对 TauriTavern WebView2 与 SillyTavern 性能优化，零全屏 blur 合成损耗 */
+/* 主角跨聊天传承插件双端样式 — 桌面端 + 手机端（TauriTavern Android/iOS WebView & SillyTavern） */
+
+.pc-lock-scroll {
+  overflow: hidden !important;
+  overscroll-behavior: none !important;
+}
 
 .pc-drawer-status {
   font-size: 0.9em;
@@ -22,21 +27,22 @@
   margin-bottom: 6px;
 }
 
-/* 去掉全屏 backdrop-filter: blur()，消除 Tauri WebView2 / Electron 下的大屏重绘卡顿 */
+/* 零全屏 backdrop-filter blur，消除手机与桌面 WebView 合成重绘卡顿 */
 .pc-overlay {
   position: fixed;
   inset: 0;
   z-index: 9990;
-  background: rgba(10, 12, 18, 0.76);
+  background: rgba(10, 12, 18, 0.78);
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 16px;
+  overscroll-behavior: contain;
 }
 
 .pc-modal {
   width: min(1040px, 96vw);
-  max-height: 90vh;
+  max-height: 90dvh;
   display: flex;
   flex-direction: column;
   border-radius: 12px;
@@ -53,19 +59,19 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 14px 18px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
   flex-shrink: 0;
 }
 
 .pc-title {
   margin: 0;
-  font-size: 1.15em;
+  font-size: 1.12em;
 }
 
 .pc-subtitle {
   display: block;
-  font-size: 0.85em;
+  font-size: 0.82em;
   opacity: 0.78;
   margin-top: 2px;
 }
@@ -74,18 +80,18 @@
   background: transparent;
   border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
   color: inherit;
-  border-radius: 6px;
-  width: 32px;
-  height: 32px;
+  border-radius: 8px;
+  min-width: 36px;
+  min-height: 36px;
   cursor: pointer;
+  flex-shrink: 0;
 }
 
 .pc-tabs {
   display: flex;
-  gap: 6px;
-  padding: 10px 18px 0;
+  gap: 4px;
+  padding: 8px 16px 0;
   border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
-  flex-wrap: wrap;
   flex-shrink: 0;
 }
 
@@ -95,22 +101,27 @@
   border: 1px solid transparent;
   border-bottom: none;
   border-radius: 8px 8px 0 0;
-  padding: 8px 14px;
+  padding: 9px 14px;
   cursor: pointer;
-  opacity: 0.78;
+  opacity: 0.76;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .pc-tab.is-active {
   opacity: 1;
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.09);
   border-color: var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
 }
 
 .pc-body {
-  padding: 16px 18px;
+  padding: 14px 16px;
   overflow-y: auto;
+  overflow-x: hidden;
   overflow-anchor: none;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
   flex: 1;
   min-height: 0;
   display: flex;
@@ -136,7 +147,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: wrap;
 }
 
@@ -163,9 +174,33 @@
   color: #ff9c9c !important;
 }
 
+.pc-mini-btn {
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 0.85em;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.pc-mini-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.pc-checkbox {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
 .pc-empty {
   text-align: center;
-  padding: 28px 16px;
+  padding: 26px 14px;
   border-radius: 8px;
   border: 1px dashed var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.2));
 }
@@ -177,8 +212,8 @@
 
 .pc-section-title {
   font-weight: 700;
-  font-size: 0.96em;
-  margin-top: 4px;
+  font-size: 0.95em;
+  margin-top: 2px;
 }
 
 .pc-form-grid {
@@ -206,13 +241,18 @@
   font-size: 0.92em;
 }
 
+.pc-grow {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .pc-textarea-sm {
-  min-height: 58px;
+  min-height: 62px;
   resize: vertical;
 }
 
 .pc-textarea-lg {
-  min-height: 220px;
+  min-height: 200px;
   resize: vertical;
   font-family: monospace;
   font-size: 0.92em;
@@ -229,11 +269,13 @@
 .pc-prompt-head,
 .pc-overflow-head,
 .pc-footer-bar,
-.pc-pager {
+.pc-pager,
+.pc-paste-head,
+.pc-row-card-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
 }
 
@@ -241,13 +283,12 @@
   margin-top: 8px;
   padding-top: 6px;
   border-top: 1px dashed rgba(255, 255, 255, 0.12);
-  justify-content: flex-start;
 }
 
 .pc-check-label {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   cursor: pointer;
 }
 
@@ -262,7 +303,7 @@
   display: inline-block;
   padding: 2px 8px;
   border-radius: 999px;
-  font-size: 0.8em;
+  font-size: 0.78em;
   background: rgba(255, 255, 255, 0.09);
   border: 1px solid rgba(255, 255, 255, 0.14);
 }
@@ -283,43 +324,51 @@
   color: var(--SmartThemeQuoteColor, #7fb3ff);
   cursor: pointer;
   font-size: 0.88em;
-  padding: 2px 4px;
+  padding: 4px 6px;
 }
 
+/* 桌面端数据表（静态文字浏览，点编辑才变输入框） */
 .pc-table-scroll {
   overflow-x: auto;
   margin-top: 8px;
 }
 
-.pc-data-table,
-.pc-map-table {
+.pc-data-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.9em;
 }
 
 .pc-data-table th,
-.pc-data-table td,
-.pc-map-table th,
-.pc-map-table td {
+.pc-data-table td {
   border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.12));
   padding: 6px 8px;
   text-align: left;
   vertical-align: top;
 }
 
-.pc-data-table th,
-.pc-map-table th {
+.pc-data-table th {
   background: rgba(255, 255, 255, 0.06);
+  white-space: nowrap;
+}
+
+.pc-cell-text {
+  max-width: 240px;
+  max-height: 4.5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: break-word;
+  line-height: 1.45;
+  cursor: text;
 }
 
 .pc-cell-input {
   width: 100%;
-  min-width: 90px;
+  min-width: 96px;
   box-sizing: border-box;
-  background: rgba(0, 0, 0, 0.25);
+  background: rgba(0, 0, 0, 0.32);
   color: inherit;
-  border: 1px solid rgba(255, 255, 255, 0.15);
+  border: 1px solid var(--SmartThemeQuoteColor, #4f8cff);
   border-radius: 4px;
   padding: 4px 6px;
 }
@@ -328,10 +377,110 @@
   opacity: 0.45;
 }
 
+.pc-row-editing {
+  background: rgba(79, 140, 255, 0.09);
+}
+
+/* 手机端竖排数据卡片流（零横滑、零输入法误触） */
+.pc-row-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.pc-row-card {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.12));
+}
+
+.pc-row-card-title {
+  font-weight: 600;
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.pc-row-card-kv {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 0.88em;
+}
+
+.pc-kv-line {
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.pc-kv-k {
+  opacity: 0.72;
+}
+
+.pc-row-edit-fields {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(79, 140, 255, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Tab 2 响应式列映射网格：桌面三栏对照 / 手机自动单列堆叠 */
+.pc-map-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.12));
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.pc-map-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 1.1fr) 145px minmax(180px, 1.4fr);
+  gap: 10px;
+  align-items: start;
+  padding: 8px 10px;
+  border-top: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.1));
+}
+
+.pc-map-row:first-child {
+  border-top: none;
+}
+
+.pc-map-row-header {
+  background: rgba(255, 255, 255, 0.06);
+  font-weight: 600;
+  font-size: 0.88em;
+}
+
+.pc-select-full {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0 !important;
+}
+
+.pc-val-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pc-map-target-select {
+  min-width: 200px;
+  margin: 0 !important;
+}
+
 .pc-status-meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: 8px 14px;
   margin-top: 8px;
   font-size: 0.88em;
 }
@@ -343,8 +492,8 @@
 }
 
 .pc-mode-btn {
-  flex: 1 1 240px;
-  padding: 9px 12px;
+  flex: 1 1 220px;
+  padding: 10px 12px;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.05);
   color: inherit;
@@ -403,7 +552,7 @@
 }
 
 .pc-tag {
-  font-size: 0.76em;
+  font-size: 0.75em;
   padding: 1px 6px;
   border-radius: 4px;
   background: rgba(255, 255, 255, 0.1);
@@ -424,16 +573,13 @@
   color: #a8ccff;
 }
 
-.pc-select-sm,
-.pc-input-sm {
+.pc-select-sm {
   margin: 0 !important;
   min-width: 140px;
 }
 
 .pc-mini-hint {
-  display: inline-block;
-  margin-left: 6px;
-  font-size: 0.82em;
+  font-size: 0.8em;
   color: #a8ccff;
 }
 
@@ -448,14 +594,14 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 2px 6px;
-  border-radius: 4px;
+  padding: 4px 8px;
+  border-radius: 6px;
   background: rgba(255, 255, 255, 0.08);
   font-size: 0.86em;
 }
 
 .pc-joiner-input {
-  width: 44px !important;
+  width: 48px !important;
   text-align: center;
   margin: 0 !important;
 }
@@ -467,6 +613,7 @@
   margin-top: 8px;
   max-height: 240px;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .pc-op-item {
@@ -500,6 +647,7 @@
   margin-top: 4px;
   opacity: 0.9;
   line-height: 1.45;
+  word-break: break-word;
 }
 
 .pc-ok {
@@ -556,6 +704,7 @@
 .pc-lib-note {
   margin-top: 4px;
   font-size: 0.9em;
+  word-break: break-word;
 }
 
 .pc-lib-actions {
@@ -580,9 +729,125 @@
   padding: 8px 0 2px;
 }
 
-@media (max-width: 720px) {
+/* ==================== 手机端专项适配（≤768px：全屏抽屉 + 大触控区 + 单列映射） ==================== */
+@media (max-width: 768px) {
+  .pc-overlay {
+    padding: 0;
+    align-items: stretch;
+  }
+
+  .pc-modal {
+    width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    border-radius: 0;
+    border: none;
+    box-shadow: none;
+  }
+
+  .pc-header {
+    padding: calc(10px + env(safe-area-inset-top, 0px)) 12px 10px;
+  }
+
+  .pc-close-btn {
+    min-width: 42px;
+    min-height: 42px;
+    font-size: 1.05em;
+  }
+
+  .pc-tabs {
+    padding: 6px 8px 0;
+    gap: 2px;
+  }
+
+  .pc-tab {
+    flex: 1 1 0;
+    text-align: center;
+    padding: 10px 6px;
+    font-size: 0.9em;
+  }
+
+  .pc-body {
+    padding: 10px 10px calc(18px + env(safe-area-inset-bottom, 0px));
+    gap: 10px;
+  }
+
+  .pc-card {
+    padding: 10px 11px;
+  }
+
   .pc-form-grid,
   .pc-grid-3 {
     grid-template-columns: 1fr;
+  }
+
+  /* 防止 iOS WKWebView 聚焦输入控件时自动缩放页面 */
+  .pc-modal input[type="text"],
+  .pc-modal input[type="number"],
+  .pc-modal select,
+  .pc-modal textarea {
+    font-size: 16px !important;
+    min-height: 40px;
+  }
+
+  .pc-modal .menu_button,
+  .pc-mode-btn {
+    min-height: 42px;
+    padding: 8px 12px;
+  }
+
+  .pc-mini-btn,
+  .pc-touch-btn {
+    min-height: 36px;
+    padding: 6px 10px;
+  }
+
+  .pc-checkbox {
+    width: 22px;
+    height: 22px;
+  }
+
+  .pc-map-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .pc-map-target-select {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .pc-map-row-header {
+    display: none;
+  }
+
+  .pc-map-row {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .pc-sticky-footer {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+    margin: 4px -10px -10px;
+    background: var(--SmartThemeBlurTintColor, #1c1f26);
+    border-top: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
+  }
+
+  .pc-footer-hint {
+    flex: 1 1 100%;
+    font-size: 0.84em;
+  }
+
+  .pc-lib-actions {
+    width: 100%;
+  }
+
+  .pc-lib-actions .menu_button {
+    flex: 1 1 auto;
+    text-align: center;
   }
 }
