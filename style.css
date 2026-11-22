@@ -1,4 +1,4 @@
-/* 主角跨聊天传承插件样式 — 全部以 .pc- 命名空间隔离，自适应 SillyTavern 原生主题变量 */
+/* 主角跨聊天传承插件样式 — 针对 TauriTavern WebView2 与 SillyTavern 性能优化，零全屏 blur 合成损耗 */
 
 .pc-drawer-status {
   font-size: 0.9em;
@@ -22,12 +22,12 @@
   margin-bottom: 6px;
 }
 
+/* 去掉全屏 backdrop-filter: blur()，消除 Tauri WebView2 / Electron 下的大屏重绘卡顿 */
 .pc-overlay {
   position: fixed;
   inset: 0;
   z-index: 9990;
-  background: rgba(0, 0, 0, 0.62);
-  backdrop-filter: blur(4px);
+  background: rgba(10, 12, 18, 0.76);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -41,10 +41,11 @@
   flex-direction: column;
   border-radius: 12px;
   overflow: hidden;
+  contain: layout paint;
   background: var(--SmartThemeBlurTintColor, #1c1f26);
   color: var(--SmartThemeBodyColor, #e8ecf1);
   border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.18));
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
 }
 
 .pc-header {
@@ -54,6 +55,7 @@
   gap: 12px;
   padding: 14px 18px;
   border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
+  flex-shrink: 0;
 }
 
 .pc-title {
@@ -84,6 +86,7 @@
   padding: 10px 18px 0;
   border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
   flex-wrap: wrap;
+  flex-shrink: 0;
 }
 
 .pc-tab {
@@ -115,10 +118,17 @@
   gap: 12px;
 }
 
+.pc-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .pc-card {
   padding: 12px 14px;
   border-radius: 8px;
-  background: rgba(0, 0, 0, 0.18);
+  contain: layout style;
+  background: rgba(0, 0, 0, 0.22);
   border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
 }
 
@@ -218,12 +228,20 @@
 .pc-status-row,
 .pc-prompt-head,
 .pc-overflow-head,
-.pc-footer-bar {
+.pc-footer-bar,
+.pc-pager {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.pc-pager {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.12);
+  justify-content: flex-start;
 }
 
 .pc-check-label {

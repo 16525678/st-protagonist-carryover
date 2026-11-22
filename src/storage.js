@@ -1,8 +1,11 @@
 /**
  * src/storage.js
- * 主角传承库与聊天级绑定状态的持久化管理。
- * 优先使用 SillyTavern.libs.localforage（IndexedDB，大容量、不撑爆 settings.json）；
- * 不可用时自动降级到 SillyTavern.getContext().extensionSettings + saveSettingsDebounced。
+ * 主角传承库与聊天级绑定状态的持久化管理（同时适配 TauriTavern 与 SillyTavern）。
+ *
+ * 存储优先级（自动降级）：
+ * 1. TauriTavern 原生持久化：window.__TAURITAVERN__.api.extension.store (setJson / tryGetJson)
+ * 2. SillyTavern 内置大容量库：SillyTavern.libs.localforage (IndexedDB)
+ * 3. SillyTavern 通用扩展设置：SillyTavern.getContext().extensionSettings + saveSettingsDebounced
  */
 
 import {
@@ -13,6 +16,8 @@ import {
 } from './schema-engine.js';
 
 export const MODULE_NAME = 'st_protagonist_carryover';
+const TT_STORE_NAMESPACE = 'st-protagonist-carryover';
+const TT_STORE_PROFILES_KEY = 'profiles_v1';
 const LOCALFORAGE_PROFILES_KEY = `${MODULE_NAME}_profiles_v1`;
 
 const DEFAULT_SETTINGS = Object.freeze({
@@ -24,6 +29,41 @@ const DEFAULT_SETTINGS = Object.freeze({
   defaultPromptRole: 'system',
 });
 
+function getTopWindowSafe() {
+  try {
+    if (typeof window !== 'undefined' && window.parent && window.parent !== window && window.parent.__TAURITAVERN__) {
+      return window.parent;
+    }
+  } catch {
+    // 跨域 iframe 忽略
+  }
+  return typeof window !== 'undefined' ? window : globalThis;
+}
+
+/** 检测当前宿主是否为 TauriTavern（Rust + 系统 WebView） */
+export function isTauriTavernHost() {
+  try {
+    const win = getTopWindowSafe();
+    return Boolean(globalThis.__TAURITAVERN__ || win?.__TAURITAVERN__);
+  } catch {
+    return false;
+  }
+}
+
+function getTauriTavernStore() {
+  try {
+    const win = getTopWindowSafe();
+    const tt = globalThis.__TAURITAVERN__ || win?.__TAURITAVERN__;
+    const store = tt?.api?.extension?.store;
+    if (store && typeof store.setJson === 'function' && typeof store.tryGetJson === 'function') {
+      return store;
+    }
+  } catch {
+    // 忽略
+  }
+  return null;
+}
+
 function getLocalForage() {
   try {
     const lf = globalThis?.SillyTavern?.libs?.localforage;
@@ -34,6 +74,21 @@ function getLocalForage() {
     // 忽略
   }
   return null;
+}
+
+export function getHostRuntimeSummary() {
+  const isTT = isTauriTavernHost();
+  const hasTtStore = Boolean(getTauriTavernStore());
+  const hasLf = Boolean(getLocalForage());
+  return {
+    isTauriTavern: isTT,
+    hostLabel: isTT ? 'TauriTavern (Tauri/WebView)' : 'SillyTavern (浏览器)',
+    storageLabel: hasTtStore
+      ? 'TauriTavern 原生 extension.store'
+      : hasLf
+        ? 'IndexedDB (localforage)'
+        : 'extensionSettings',
+  };
 }
 
 export function getExtensionSettings(context) {
@@ -65,33 +120,81 @@ function saveSettings(context) {
   }
 }
 
-/** 读取所有已保存的主角传承档案 */
+/** 读取所有已保存的主角传承档案（按 TT store -> localforage -> extensionSettings 顺序，并自动向下兼容迁移） */
 export async function loadProfiles(context) {
+  const ttStore = getTauriTavernStore();
+  if (ttStore) {
+    try {
+      const res = await ttStore.tryGetJson({
+        namespace: TT_STORE_NAMESPACE,
+        key: TT_STORE_PROFILES_KEY,
+      });
+      if (res?.found && Array.isArray(res.value)) {
+        return deepCloneSafe(res.value);
+      }
+    } catch (err) {
+      console.warn('[ProtagonistCarryover] TauriTavern store read failed, falling back:', err);
+    }
+  }
+
   const lf = getLocalForage();
   if (lf) {
     try {
       const saved = await lf.getItem(LOCALFORAGE_PROFILES_KEY);
-      if (Array.isArray(saved)) {
+      if (Array.isArray(saved) && saved.length > 0) {
+        // 如果是在 TT 里升级后首次读取旧 IndexedDB 数据，自动同步一份到 TT 原生 store
+        if (ttStore) {
+          ttStore.setJson({
+            namespace: TT_STORE_NAMESPACE,
+            key: TT_STORE_PROFILES_KEY,
+            value: deepCloneSafe(saved),
+          }).catch(() => {});
+        }
         return deepCloneSafe(saved);
       }
-      // 首次从 fallbackProfiles 迁移（如果此前在无 localforage 环境存过）
-      const settings = getExtensionSettings(context);
-      if (settings.fallbackProfiles.length > 0) {
-        await lf.setItem(LOCALFORAGE_PROFILES_KEY, deepCloneSafe(settings.fallbackProfiles));
-        return deepCloneSafe(settings.fallbackProfiles);
-      }
-      return [];
     } catch (err) {
-      console.warn('[ProtagonistCarryover] localforage read failed, falling back to extensionSettings:', err);
+      console.warn('[ProtagonistCarryover] localforage read failed, falling back:', err);
     }
   }
+
   const settings = getExtensionSettings(context);
-  return deepCloneSafe(settings.fallbackProfiles);
+  if (settings.fallbackProfiles.length > 0) {
+    const migrated = deepCloneSafe(settings.fallbackProfiles);
+    if (ttStore) {
+      ttStore.setJson({
+        namespace: TT_STORE_NAMESPACE,
+        key: TT_STORE_PROFILES_KEY,
+        value: migrated,
+      }).catch(() => {});
+    } else if (lf) {
+      lf.setItem(LOCALFORAGE_PROFILES_KEY, migrated).catch(() => {});
+    }
+    return migrated;
+  }
+  return [];
 }
 
 /** 保存全部主角传承档案列表 */
 export async function saveProfiles(context, profiles) {
   const clean = deepCloneSafe(Array.isArray(profiles) ? profiles : []);
+
+  const ttStore = getTauriTavernStore();
+  if (ttStore) {
+    try {
+      await ttStore.setJson({
+        namespace: TT_STORE_NAMESPACE,
+        key: TT_STORE_PROFILES_KEY,
+        value: clean,
+      });
+      // 同时异步双写一份到 localforage（如果可用）作为本地缓存保底，不阻塞主流程
+      const lf = getLocalForage();
+      if (lf) lf.setItem(LOCALFORAGE_PROFILES_KEY, clean).catch(() => {});
+      return { backend: 'tauritavern-store' };
+    } catch (err) {
+      console.warn('[ProtagonistCarryover] TauriTavern store write failed, falling back:', err);
+    }
+  }
+
   const lf = getLocalForage();
   if (lf) {
     try {
@@ -101,6 +204,7 @@ export async function saveProfiles(context, profiles) {
       console.warn('[ProtagonistCarryover] localforage write failed, falling back to extensionSettings:', err);
     }
   }
+
   const settings = getExtensionSettings(context);
   settings.fallbackProfiles = clean;
   saveSettings(context);
@@ -165,7 +269,7 @@ export function serializeProfilesArchive(profiles) {
   return JSON.stringify(payload, null, 2);
 }
 
-/** 在浏览器中触发 JSON 文件下载 */
+/** 在浏览器/Tauri WebView 中触发 JSON 文件下载 */
 export function triggerJsonDownload(filename, jsonString) {
   const blob = new Blob([jsonString], { type: 'application/json;charset=utf-8' });
   const url = URL.createObjectURL(blob);

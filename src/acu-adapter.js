@@ -1,10 +1,10 @@
 /**
  * src/acu-adapter.js
  * 与「龙血玄黄·数据库（AlbusKen/shujuku）」运行时的安全对接层。
- * 通过公开全局对象 window.AutoCardUpdaterAPI 读写表格，不触碰数据库内部私有状态。
+ * 针对大表聊天（如数百行纪要表）优化了读取路径：不再对整份 tableData 做多余的 JSON 深拷贝。
  */
 
-import { extractSheetsFromTableData, deepCloneSafe } from './schema-engine.js';
+import { extractSheetsFromTableData } from './schema-engine.js';
 
 function getTopWindow() {
   try {
@@ -43,6 +43,29 @@ export function detectAcuApi() {
       canReadContext: typeof api.getTableHistoryContext === 'function',
     },
   };
+}
+
+/** 极轻量状态探针（供侧边栏抽屉显示，不解析任何表格行数据、零卡顿） */
+export function probeAcuStatusLight() {
+  const acu = detectAcuApi();
+  if (!acu.available || !acu.capabilities.canRead) {
+    return { ok: false, sheetCount: 0 };
+  }
+  try {
+    const rawData = acu.api.exportTableAsJson();
+    if (!rawData || typeof rawData !== 'object') {
+      return { ok: false, sheetCount: 0 };
+    }
+    let sheetCount = 0;
+    for (const key of Object.keys(rawData)) {
+      if (key.startsWith('sheet_') && Array.isArray(rawData[key]?.content)) {
+        sheetCount += 1;
+      }
+    }
+    return { ok: sheetCount > 0, sheetCount };
+  } catch {
+    return { ok: false, sheetCount: 0 };
+  }
 }
 
 /** 读取当前聊天是否至少有一条 AI 消息（龙血玄黄 V2 持久化需要挂载到最新 AI 楼层） */
@@ -102,7 +125,7 @@ export function getCurrentChatIdentity(stContext) {
   };
 }
 
-/** 实时读取当前聊天龙血玄黄数据库的全部表格 */
+/** 实时读取当前聊天龙血玄黄数据库的全部表格（直接解析只读视图，不做多余整库 JSON 深拷贝） */
 export function readCurrentChatAcuTables(stContext) {
   const acu = detectAcuApi();
   const floorState = inspectCurrentChatFloorState(stContext);
@@ -147,8 +170,8 @@ export function readCurrentChatAcuTables(stContext) {
     };
   }
 
-  const tableData = deepCloneSafe(rawData);
-  const sheets = extractSheetsFromTableData(tableData);
+  // extractSheetsFromTableData 已只读提取并生成独立字符串副本，无需对 rawData 整树 JSON.stringify
+  const sheets = extractSheetsFromTableData(rawData);
   if (sheets.length === 0) {
     return {
       ok: false,
@@ -156,7 +179,7 @@ export function readCurrentChatAcuTables(stContext) {
       acu,
       floorState,
       identity,
-      tableData,
+      tableData: rawData,
       sheets: [],
     };
   }
@@ -167,7 +190,7 @@ export function readCurrentChatAcuTables(stContext) {
     acu,
     floorState,
     identity,
-    tableData,
+    tableData: rawData,
     sheets,
   };
 }

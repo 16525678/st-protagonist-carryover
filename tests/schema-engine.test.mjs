@@ -21,6 +21,12 @@ import {
   registerGenerateInterceptor,
   unregisterGenerateInterceptor,
 } from '../src/prompt-injector.js';
+import {
+  getHostRuntimeSummary,
+  isTauriTavernHost,
+  loadProfiles,
+  saveProfiles,
+} from '../src/storage.js';
 
 /** 真实还原 AlbusKen/shujuku 原版默认模板（主角信息表 + 主角技能表 + 背包物品表） */
 function makeClassicAcuTables() {
@@ -509,4 +515,44 @@ test('10. 放宽后 DDL 仍按 note 识别单行/唯一键；GLOB、数值下限
   assert.equal(compiled.operations[1].errors.length, 1);
   assert.match(compiled.operations[1].errors[0], /GLOB/);
 });
+
+test('11. TauriTavern 宿主检测与原生 extension.store 读写优先级及降级', async () => {
+  const ttMem = new Map();
+  globalThis.__TAURITAVERN__ = {
+    api: {
+      extension: {
+        store: {
+          setJson: async ({ namespace, key, value }) => {
+            ttMem.set(`${namespace}:${key}`, value);
+          },
+          tryGetJson: async ({ namespace, key }) => {
+            const k = `${namespace}:${key}`;
+            return ttMem.has(k) ? { found: true, value: ttMem.get(k) } : { found: false };
+          },
+        },
+      },
+    },
+  };
+
+  assert.equal(isTauriTavernHost(), true);
+  assert.match(getHostRuntimeSummary().hostLabel, /TauriTavern/);
+
+  const mockCtx = { extensionSettings: {}, saveSettingsDebounced: () => {} };
+  const sample = [createProtagonistProfile({ name: 'TT主角', tables: [] })];
+  const writeRes = await saveProfiles(mockCtx, sample);
+  assert.equal(writeRes.backend, 'tauritavern-store');
+
+  const loaded = await loadProfiles(mockCtx);
+  assert.equal(loaded.length, 1);
+  assert.equal(loaded[0].name, 'TT主角');
+
+  // 清除 TT 全局对象后自动降级到 extensionSettings
+  delete globalThis.__TAURITAVERN__;
+  assert.equal(isTauriTavernHost(), false);
+  const fallbackWrite = await saveProfiles(mockCtx, sample);
+  assert.equal(fallbackWrite.backend, 'extensionSettings');
+  const fallbackLoaded = await loadProfiles(mockCtx);
+  assert.equal(fallbackLoaded[0].name, 'TT主角');
+});
+
 

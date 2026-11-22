@@ -20,6 +20,13 @@
       "fallback": "Falls back to manifest generate_interceptor (ProtagonistCarryover_interceptGeneration) without double injection."
     },
     {
+      "id": "tt-extension-store",
+      "owner": "provider",
+      "symbol": "window.__TAURITAVERN__.api.extension.store",
+      "required": false,
+      "fallback": "Falls back to SillyTavern.libs.localforage or extensionSettings on standard SillyTavern hosts."
+    },
+    {
       "id": "st-localforage",
       "owner": "sillytavern",
       "symbol": "SillyTavern.libs.localforage",

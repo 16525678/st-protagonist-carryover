@@ -1,7 +1,12 @@
 /**
  * src/ui.js
- * 新手友好的三页式「主角跨聊天传承工作台」弹窗与酒馆设置面板抽屉。
- * 所有来自数据库、JSON 文件和用户输入的文本在拼装 HTML 时均经过严格转义（防 XSS）。
+ * 高性能事件委托 + 局部精准 DOM 更新工作台（适配 TauriTavern WebView2 与 SillyTavern）。
+ *
+ * 性能与体验保证：
+ * 1. 全局仅在 .pc-body 挂载 3 个委托监听器（click/change/input），不再循环绑几百个事件；
+ * 2. 勾选表/行、展开收起、修改列映射与固定值时均走局部 DOM 补丁，不整页重绘、不跳回顶部；
+ * 3. 大表默认分页渲染（每次 30 行，可按需加载更多），避免数百行纪要表卡死 WebView；
+ * 4. 所有来自数据库、JSON 与用户输入的文本均经过 escapeHtml 严格转义（防 XSS）。
  */
 
 import {
@@ -19,6 +24,7 @@ import {
 import {
   executeCompiledWritePlan,
   getCurrentChatIdentity,
+  probeAcuStatusLight,
   readCurrentChatAcuTables,
 } from './acu-adapter.js';
 import {
@@ -30,6 +36,7 @@ import {
   deleteProfile,
   getChatBinding,
   getExtensionSettings,
+  getHostRuntimeSummary,
   loadProfiles,
   serializeProfilesArchive,
   setChatBinding,
@@ -39,6 +46,8 @@ import {
 
 const MODAL_ID = 'pc-workbench-overlay';
 const DRAWER_ID = 'pc-settings-drawer';
+const PAGE_SIZE_ROWS = 30;
+const PAGE_SIZE_OPS = 30;
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -75,14 +84,13 @@ export function createWorkbenchController({ getContext }) {
   const state = {
     activeTab: 'export', // 'export' | 'inherit' | 'library'
     profiles: [],
-    // Tab 1: 导出草稿状态
-    exportDraft: null, // { editingProfileId, sourceLabel, name, note, sheets: [{ sheetKey, name, role, ddlTableName, isSingleRow, headers, columnSqlNames, selected, expanded, rows: [{ selected, values }] }] }
-    // Tab 2: 继承状态
+    exportDraft: null,
     selectedProfileId: '',
     inheritMode: 'db', // 'db' | 'prompt'
     targetReadResult: null,
     mappingPlan: null,
     alsoInjectOverflow: true,
+    showAllOps: false,
     lastWriteReceipt: null,
     promptDraftText: '',
     promptPosition: 'in_chat',
@@ -92,6 +100,11 @@ export function createWorkbenchController({ getContext }) {
   };
 
   let modalEl = null;
+  let preflightDebounceTimer = null;
+
+  function getBodyEl() {
+    return modalEl?.querySelector('.pc-body') || null;
+  }
 
   async function refreshProfiles() {
     state.profiles = await loadProfiles(getContext());
@@ -128,6 +141,7 @@ export function createWorkbenchController({ getContext }) {
         columnSqlNames,
         selected: defaultSelected && rows.length > 0,
         expanded: defaultSelected && rows.length > 0,
+        visibleLimit: PAGE_SIZE_ROWS,
         rows,
       };
     });
@@ -156,6 +170,7 @@ export function createWorkbenchController({ getContext }) {
       columnSqlNames: { ...(t.columnSqlNames || {}) },
       selected: true,
       expanded: true,
+      visibleLimit: PAGE_SIZE_ROWS,
       rows: (t.rows || []).map(row => ({
         selected: true,
         values: { ...row },
@@ -173,6 +188,7 @@ export function createWorkbenchController({ getContext }) {
   function refreshTargetContextForInherit({ resetMapping = false } = {}) {
     const ctx = getContext();
     state.targetReadResult = readCurrentChatAcuTables(ctx);
+    state.showAllOps = false;
     const profile = getSelectedProfile();
     const settings = getExtensionSettings(ctx);
     const identity = state.targetReadResult.identity;
@@ -205,7 +221,7 @@ export function createWorkbenchController({ getContext }) {
     }
   }
 
-  /** 刷新设置面板抽屉内的状态摘要 */
+  /** 刷新设置面板抽屉内的状态摘要（使用极轻量探针，零解析开销） */
   function updateSettingsDrawerStatus() {
     const drawer = document.getElementById(DRAWER_ID);
     if (!drawer) return;
@@ -213,14 +229,15 @@ export function createWorkbenchController({ getContext }) {
     const identity = getCurrentChatIdentity(ctx);
     const binding = getChatBinding(ctx, identity.bindingKey);
     const injStatus = getActiveInjectionStatus();
-    const readProbe = readCurrentChatAcuTables(ctx);
+    const probe = probeAcuStatusLight();
+    const runtime = getHostRuntimeSummary();
 
     const statusEl = drawer.querySelector('[data-pc-drawer-status]');
     const clearBtn = drawer.querySelector('[data-pc-drawer-clear]');
     if (!statusEl) return;
 
-    const dbText = readProbe.ok
-      ? `已检测到龙血玄黄数据库（${readProbe.sheets.length} 张表）`
+    const dbText = probe.ok
+      ? `已检测到龙血玄黄数据库（${probe.sheetCount} 张表）`
       : '当前聊天未检测到龙血玄黄数据库（可用文件导入 / 提示词注入）';
 
     const bindText = binding?.enabled
@@ -228,6 +245,7 @@ export function createWorkbenchController({ getContext }) {
       : '当前聊天未绑定主角提示词注入';
 
     statusEl.innerHTML = `
+      <div class="pc-drawer-line">环境：<span>${escapeHtml(runtime.hostLabel)} · ${escapeHtml(runtime.storageLabel)}</span></div>
       <div class="pc-drawer-line">聊天：<span>${escapeHtml(identity.displayLabel)}</span></div>
       <div class="pc-drawer-line">数据库：<span>${escapeHtml(dbText)}</span></div>
       <div class="pc-drawer-line">注入：<span>${bindText}</span></div>
@@ -237,7 +255,6 @@ export function createWorkbenchController({ getContext }) {
     }
   }
 
-  /** 将入口抽屉挂载到 SillyTavern 扩展设置栏 */
   function mountSettingsDrawer() {
     if (document.getElementById(DRAWER_ID)) {
       updateSettingsDrawerStatus();
@@ -295,10 +312,14 @@ export function createWorkbenchController({ getContext }) {
       refreshTargetContextForInherit({ resetMapping: true });
     }
     ensureModalElement();
-    renderModal({ resetScroll: true });
+    renderCurrentTab({ resetScroll: true });
   }
 
   function closeWorkbench() {
+    if (preflightDebounceTimer) {
+      clearTimeout(preflightDebounceTimer);
+      preflightDebounceTimer = null;
+    }
     if (modalEl) {
       modalEl.remove();
       modalEl = null;
@@ -309,6 +330,8 @@ export function createWorkbenchController({ getContext }) {
   function ensureModalElement() {
     if (modalEl && document.body.contains(modalEl)) return modalEl;
     document.getElementById(MODAL_ID)?.remove();
+    const runtime = getHostRuntimeSummary();
+
     modalEl = document.createElement('div');
     modalEl.id = MODAL_ID;
     modalEl.className = 'pc-overlay';
@@ -317,7 +340,7 @@ export function createWorkbenchController({ getContext }) {
         <div class="pc-header">
           <div class="pc-title-wrap">
             <h3 class="pc-title">主角跨聊天传承工作台</h3>
-            <span class="pc-subtitle">适配 龙血玄黄·数据库（AlbusKen/shujuku） · 跨表规则自动适配</span>
+            <span class="pc-subtitle">适配 龙血玄黄·数据库 · ${escapeHtml(runtime.hostLabel)} · 存储：${escapeHtml(runtime.storageLabel)}</span>
           </div>
           <button type="button" class="pc-close-btn" data-pc-close title="关闭">✕</button>
         </div>
@@ -329,90 +352,118 @@ export function createWorkbenchController({ getContext }) {
         <div class="pc-body"></div>
       </div>
     `;
+
     modalEl.addEventListener('click', (evt) => {
       if (evt.target === modalEl) closeWorkbench();
     });
     modalEl.querySelector('[data-pc-close]')?.addEventListener('click', closeWorkbench);
     modalEl.querySelectorAll('.pc-tabs [data-pc-tab]').forEach(btn => {
       btn.addEventListener('click', () => {
-        state.activeTab = btn.dataset.pcTab;
-        state.lastWriteReceipt = null;
-        if (state.activeTab === 'inherit') {
-          refreshTargetContextForInherit({ resetMapping: true });
-        }
-        renderModal({ resetScroll: true });
+        switchTab(btn.dataset.pcTab);
       });
     });
+
+    // 在 .pc-body 上仅挂载 3 个持久化事件委托监听器，彻底避免重绘时反复绑事件
+    const bodyEl = modalEl.querySelector('.pc-body');
+    bodyEl.addEventListener('click', handleBodyClick);
+    bodyEl.addEventListener('change', handleBodyChange);
+    bodyEl.addEventListener('input', handleBodyInput);
+
     document.body.appendChild(modalEl);
     return modalEl;
   }
 
-  function renderModal({ resetScroll = false } = {}) {
+  function updateTabHeaderBar() {
     if (!modalEl) return;
-    const bodyEl = modalEl.querySelector('.pc-body');
-    if (!bodyEl) return;
-
-    // 重绘前记录当前纵向滚动位置、内部表格横向/纵向滚动位置以及展开的规则说明
-    const savedBodyScrollTop = resetScroll ? 0 : bodyEl.scrollTop;
-    const savedInnerScrolls = new Map();
-    const savedOpenDetails = new Set();
-    if (!resetScroll) {
-      bodyEl.querySelectorAll('[data-pc-scroll-key]').forEach(el => {
-        savedInnerScrolls.set(el.dataset.pcScrollKey, {
-          top: el.scrollTop,
-          left: el.scrollLeft,
-        });
-      });
-      bodyEl.querySelectorAll('details[data-pc-details-key]').forEach(el => {
-        if (el.open) savedOpenDetails.add(el.dataset.pcDetailsKey);
-      });
-    }
-
-    // 只更新标签高亮与计数，不销毁弹窗外框与 .pc-body 节点
     modalEl.querySelectorAll('.pc-tabs [data-pc-tab]').forEach(btn => {
       btn.classList.toggle('is-active', btn.dataset.pcTab === state.activeTab);
       if (btn.dataset.pcTab === 'library') {
         btn.textContent = `3. 主角传承库 (${state.profiles.length})`;
       }
     });
+  }
 
-    const tabHtml =
+  function switchTab(nextTab) {
+    state.activeTab = nextTab;
+    state.lastWriteReceipt = null;
+    if (state.activeTab === 'inherit') {
+      refreshTargetContextForInherit({ resetMapping: true });
+    }
+    renderCurrentTab({ resetScroll: true });
+  }
+
+  /** 仅在切换大标签/重新载入整页数据时调用，日常微调均走下方局部 DOM 补丁 */
+  function renderCurrentTab({ resetScroll = false } = {}) {
+    const bodyEl = getBodyEl();
+    if (!bodyEl) return;
+    const savedScrollTop = resetScroll ? 0 : bodyEl.scrollTop;
+    updateTabHeaderBar();
+
+    bodyEl.innerHTML =
       state.activeTab === 'export'
         ? renderExportTab()
         : state.activeTab === 'inherit'
           ? renderInheritTab()
           : renderLibraryTab();
 
-    bodyEl.innerHTML = tabHtml;
-    bindBodyEvents(bodyEl);
-
-    // 先恢复 <details> 展开状态再恢复滚动位置，防止高度变化导致偏移
-    if (!resetScroll) {
-      savedOpenDetails.forEach(key => {
-        const el = bodyEl.querySelector(`details[data-pc-details-key="${key}"]`);
-        if (el) el.open = true;
-      });
-    }
-
-    const restoreScroll = () => {
-      bodyEl.scrollTop = savedBodyScrollTop;
-      if (!resetScroll) {
-        savedInnerScrolls.forEach((pos, key) => {
-          const el = bodyEl.querySelector(`[data-pc-scroll-key="${key}"]`);
-          if (el) {
-            el.scrollTop = pos.top;
-            el.scrollLeft = pos.left;
-          }
-        });
-      }
-    };
-    restoreScroll();
-    if (typeof globalThis.requestAnimationFrame === 'function') {
-      globalThis.requestAnimationFrame(restoreScroll);
-    }
+    bodyEl.scrollTop = savedScrollTop;
   }
 
-  /* ===================== Tab 1: 导出主角 ===================== */
+  /* ===================== Tab 1: 导出主角（含分页 & 局部补丁） ===================== */
+  function renderSheetRowsBodyHtml(s, sIdx) {
+    if (!s.expanded) return '';
+    if (s.rows.length === 0) {
+      return `<div class="pc-muted pc-pad-sm">这张表目前是空的（暂无数据行）。</div>`;
+    }
+    const limit = Math.min(s.rows.length, s.visibleLimit || PAGE_SIZE_ROWS);
+    const rowsHtml = [];
+    for (let rIdx = 0; rIdx < limit; rIdx += 1) {
+      const r = s.rows[rIdx];
+      const cellDisabled = !(s.selected && r.selected);
+      rowsHtml.push(`
+        <tr data-pc-row-tr="${sIdx}:${rIdx}" class="${r.selected ? '' : 'pc-row-dim'}">
+          <td>
+            <input type="checkbox" data-pc-row-toggle="${sIdx}:${rIdx}" ${r.selected ? 'checked' : ''} ${s.selected ? '' : 'disabled'} />
+          </td>
+          ${s.headers
+            .map(
+              (h, cIdx) => `
+            <td>
+              <input type="text" class="pc-cell-input" data-pc-cell="${sIdx}:${rIdx}:${cIdx}" value="${escapeHtml(r.values[h] ?? '')}" ${cellDisabled ? 'disabled' : ''} />
+            </td>
+          `
+            )
+            .join('')}
+        </tr>
+      `);
+    }
+
+    const remaining = s.rows.length - limit;
+    const pagerHtml =
+      remaining > 0
+        ? `<div class="pc-pager">
+            <span class="pc-muted">已显示前 ${limit} 行（共 ${s.rows.length} 行，未显示的行保持默认勾选状态）</span>
+            <button type="button" class="pc-link-btn" data-pc-sheet-more="${sIdx}">再加载 ${Math.min(remaining, PAGE_SIZE_ROWS)} 行</button>
+            <button type="button" class="pc-link-btn" data-pc-sheet-all="${sIdx}">展开全部 ${s.rows.length} 行</button>
+          </div>`
+        : '';
+
+    return `
+      <div class="pc-table-scroll">
+        <table class="pc-data-table">
+          <thead>
+            <tr>
+              <th style="width:36px;">选</th>
+              ${s.headers.map(h => `<th>${escapeHtml(h)}</th>`).join('')}
+            </tr>
+          </thead>
+          <tbody>${rowsHtml.join('')}</tbody>
+        </table>
+      </div>
+      ${pagerHtml}
+    `;
+  }
+
   function renderExportTab() {
     const draft = state.exportDraft;
     const topBar = `
@@ -441,54 +492,14 @@ export function createWorkbenchController({ getContext }) {
       `;
     }
 
-    const selectedRowTotal = draft.sheets.reduce(
-      (sum, s) => sum + (s.selected ? s.rows.filter(r => r.selected).length : 0),
-      0
-    );
+    const { selectedSheetsCount, selectedRowTotal } = computeExportSelectionStats();
 
     const sheetCards = draft.sheets
       .map((s, sIdx) => {
         const isRecommended = isDefaultProtagonistRole(s.role);
         const checkedRowsCount = s.rows.filter(r => r.selected).length;
-        const rowsHtml = s.expanded
-          ? s.rows.length === 0
-            ? `<div class="pc-muted pc-pad-sm">这张表目前是空的（暂无数据行）。</div>`
-            : `<div class="pc-table-scroll" data-pc-scroll-key="export-sheet-${sIdx}">
-                <table class="pc-data-table">
-                  <thead>
-                    <tr>
-                      <th style="width:36px;">选</th>
-                      ${s.headers.map(h => `<th>${escapeHtml(h)}</th>`).join('')}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${s.rows
-                      .map(
-                        (r, rIdx) => `
-                      <tr class="${r.selected ? '' : 'pc-row-dim'}">
-                        <td>
-                          <input type="checkbox" data-pc-row-toggle="${sIdx}:${rIdx}" ${r.selected ? 'checked' : ''} ${s.selected ? '' : 'disabled'} />
-                        </td>
-                        ${s.headers
-                          .map(
-                            (h, cIdx) => `
-                          <td>
-                            <input type="text" class="pc-cell-input" data-pc-cell="${sIdx}:${rIdx}:${cIdx}" value="${escapeHtml(r.values[h] ?? '')}" ${s.selected && r.selected ? '' : 'disabled'} />
-                          </td>
-                        `
-                          )
-                          .join('')}
-                      </tr>
-                    `
-                      )
-                      .join('')}
-                  </tbody>
-                </table>
-              </div>`
-          : '';
-
         return `
-          <div class="pc-card pc-sheet-card ${s.selected ? 'is-selected' : ''}">
+          <div class="pc-card pc-sheet-card ${s.selected ? 'is-selected' : ''}" data-pc-sheet-card="${sIdx}">
             <div class="pc-sheet-head">
               <label class="pc-check-label">
                 <input type="checkbox" data-pc-sheet-toggle="${sIdx}" ${s.selected ? 'checked' : ''} ${s.rows.length === 0 ? 'disabled' : ''} />
@@ -497,13 +508,13 @@ export function createWorkbenchController({ getContext }) {
               <div class="pc-badges">
                 ${isRecommended ? '<span class="pc-badge pc-badge-info">主角核心表</span>' : ''}
                 ${s.isSingleRow ? '<span class="pc-badge">单行表</span>' : '<span class="pc-badge">多行表</span>'}
-                <span class="pc-badge">${checkedRowsCount} / ${s.rows.length} 行</span>
+                <span class="pc-badge" data-pc-sheet-count="${sIdx}">${checkedRowsCount} / ${s.rows.length} 行</span>
                 <button type="button" class="pc-link-btn" data-pc-sheet-expand="${sIdx}">
                   ${s.expanded ? '收起表格 ▲' : '展开微调 ▼'}
                 </button>
               </div>
             </div>
-            ${rowsHtml}
+            <div data-pc-sheet-body="${sIdx}">${renderSheetRowsBodyHtml(s, sIdx)}</div>
           </div>
         `;
       })
@@ -530,7 +541,7 @@ export function createWorkbenchController({ getContext }) {
       <div class="pc-section-title">勾选要带走的表和行（可以直接在格子里改字）</div>
       ${sheetCards}
       <div class="pc-footer-bar">
-        <span class="pc-muted">当前已选：${draft.sheets.filter(s => s.selected).length} 张表，共 ${selectedRowTotal} 行数据</span>
+        <span class="pc-muted" data-pc-export-stats>当前已选：${selectedSheetsCount} 张表，共 ${selectedRowTotal} 行数据</span>
         <button type="button" class="menu_button pc-btn-primary" data-pc-save-profile ${selectedRowTotal === 0 ? 'disabled' : ''}>
           ${draft.editingProfileId ? '保存修改到主角传承库' : '保存到主角传承库'}
         </button>
@@ -538,13 +549,59 @@ export function createWorkbenchController({ getContext }) {
     `;
   }
 
-  /* ===================== Tab 2: 继承到当前聊天 ===================== */
+  function computeExportSelectionStats() {
+    const sheets = state.exportDraft?.sheets || [];
+    let selectedSheetsCount = 0;
+    let selectedRowTotal = 0;
+    for (const s of sheets) {
+      if (!s.selected) continue;
+      selectedSheetsCount += 1;
+      for (const r of s.rows) {
+        if (r.selected) selectedRowTotal += 1;
+      }
+    }
+    return { selectedSheetsCount, selectedRowTotal };
+  }
+
+  /** 局部补丁：只更新某张表的计数与底部统计，0 全页重绘 */
+  function patchExportCounts(sIdx) {
+    const bodyEl = getBodyEl();
+    const s = state.exportDraft?.sheets[sIdx];
+    if (!bodyEl || !s) return;
+    const countEl = bodyEl.querySelector(`[data-pc-sheet-count="${sIdx}"]`);
+    if (countEl) {
+      const checked = s.rows.filter(r => r.selected).length;
+      countEl.textContent = `${checked} / ${s.rows.length} 行`;
+    }
+    const { selectedSheetsCount, selectedRowTotal } = computeExportSelectionStats();
+    const statsEl = bodyEl.querySelector('[data-pc-export-stats]');
+    if (statsEl) {
+      statsEl.textContent = `当前已选：${selectedSheetsCount} 张表，共 ${selectedRowTotal} 行数据`;
+    }
+    const saveBtn = bodyEl.querySelector('[data-pc-save-profile]');
+    if (saveBtn) {
+      saveBtn.disabled = selectedRowTotal === 0;
+    }
+  }
+
+  /** 局部补丁：只更新单个表卡片的展开区 */
+  function patchSheetBody(sIdx) {
+    const bodyEl = getBodyEl();
+    const s = state.exportDraft?.sheets[sIdx];
+    if (!bodyEl || !s) return;
+    const container = bodyEl.querySelector(`[data-pc-sheet-body="${sIdx}"]`);
+    if (container) container.innerHTML = renderSheetRowsBodyHtml(s, sIdx);
+    const btn = bodyEl.querySelector(`[data-pc-sheet-expand="${sIdx}"]`);
+    if (btn) btn.textContent = s.expanded ? '收起表格 ▲' : '展开微调 ▼';
+  }
+
+  /* ===================== Tab 2: 继承到当前聊天（局部映射 + 体检区） ===================== */
   function renderInheritTab() {
     if (state.profiles.length === 0) {
       return `
         <div class="pc-empty">
           <p>「主角传承库」里还没有保存任何主角。</p>
-          <button type="button" class="menu_button pc-btn-primary" data-pc-tab="export">先去导出一位主角 →</button>
+          <button type="button" class="menu_button pc-btn-primary" data-pc-jump-tab="export">先去导出一位主角 →</button>
         </div>
       `;
     }
@@ -570,11 +627,8 @@ export function createWorkbenchController({ getContext }) {
           </label>
           <button type="button" class="menu_button" data-pc-refresh-target>重新扫描当前聊天</button>
         </div>
-        <div class="pc-status-meta">
-          <span>当前聊天：<b>${escapeHtml(identity.displayLabel)}</b></span>
-          <span>数据库：${readRes.ok ? `<b class="pc-ok">已连接（${readRes.sheets.length} 张表）</b>` : `<b class="pc-warn">未检测到</b>`}</span>
-          <span>AI 楼层：${readRes.floorState.hasAiFloor ? `<b class="pc-ok">已有 ${readRes.floorState.aiFloorCount} 条</b>` : `<b class="pc-err">无 AI 楼层（写表需先有开场白）</b>`}</span>
-          <span>提示词注入：${binding?.enabled ? `<b class="pc-ok">已启用（${escapeHtml(binding.profileName || '')}）</b>` : `<span class="pc-muted">未开启</span>`}</span>
+        <div class="pc-status-meta" data-pc-inherit-status-meta>
+          ${renderInheritStatusMetaHtml(identity, readRes, binding)}
         </div>
       </div>
     `;
@@ -595,164 +649,141 @@ export function createWorkbenchController({ getContext }) {
         ? renderDbWritebackSection(profile, readRes)
         : renderPromptInjectSection(profile, identity, binding);
 
-    return `${statusBanner}${modeSwitcher}${bodyHtml}`;
+    return `${statusBanner}${modeSwitcher}<div data-pc-inherit-mode-host>${bodyHtml}</div>`;
   }
 
-  function renderDbWritebackSection(profile, readRes) {
-    if (!readRes.ok) {
-      return `
-        <div class="pc-empty">
-          <p>${escapeHtml(readRes.reason)}</p>
-          <p class="pc-muted">如果当前角色卡本身没有使用龙血玄黄数据库，直接切到「模式 B：纯提示词注入」一样可以让 AI 记住你的主角！</p>
-          <button type="button" class="menu_button pc-btn-primary" data-pc-inherit-mode="prompt">切换到纯提示词注入</button>
-        </div>
-      `;
+  function renderInheritStatusMetaHtml(identity, readRes, binding) {
+    return `
+      <span>当前聊天：<b>${escapeHtml(identity.displayLabel)}</b></span>
+      <span>数据库：${readRes.ok ? `<b class="pc-ok">已连接（${readRes.sheets.length} 张表）</b>` : `<b class="pc-warn">未检测到</b>`}</span>
+      <span>AI 楼层：${readRes.floorState.hasAiFloor ? `<b class="pc-ok">已有 ${readRes.floorState.aiFloorCount} 条</b>` : `<b class="pc-err">无 AI 楼层（写表需先有开场白）</b>`}</span>
+      <span>提示词注入：${binding?.enabled ? `<b class="pc-ok">已启用（${escapeHtml(binding.profileName || '')}）</b>` : `<span class="pc-muted">未开启</span>`}</span>
+    `;
+  }
+
+  function renderColumnValueControlHtml(srcTable, tgtSchema, tCol, cm, mIdx, cIdx) {
+    if (cm.mode === 'source_column') {
+      const srcOpts = [
+        '<option value="">-- 请选择源列 --</option>',
+        ...srcTable.headers.map(h => `<option value="${escapeHtml(h)}" ${h === cm.sourceColumn ? 'selected' : ''}>${escapeHtml(h)}</option>`),
+      ].join('');
+      const partBadge = cm.extractPart ? `<span class="pc-mini-hint">自动提取：${cm.extractPart === 'gender' ? '性别' : '年龄'}</span>` : '';
+      return `<select class="text_pole pc-select-sm" data-pc-col-src="${mIdx}:${cIdx}">${srcOpts}</select>${partBadge}`;
     }
-
-    if (!state.mappingPlan) {
-      state.mappingPlan = buildDefaultMappingPlan(profile, readRes.tableData);
+    if (cm.mode === 'combine_columns') {
+      const cbs = srcTable.headers
+        .map(
+          h => `<label class="pc-chip"><input type="checkbox" data-pc-col-combine="${mIdx}:${cIdx}" value="${escapeHtml(h)}" ${(cm.combineColumns || []).includes(h) ? 'checked' : ''} />${escapeHtml(h)}</label>`
+        )
+        .join('');
+      return `<div class="pc-combine-wrap">${cbs}<input type="text" class="text_pole pc-joiner-input" data-pc-col-joiner="${mIdx}:${cIdx}" value="${escapeHtml(cm.joiner ?? '/')}" title="连接符号" /></div>`;
     }
-
-    const compiled = compileWritePlan(profile, readRes.tableData, state.mappingPlan);
-    const targetByKey = new Map(readRes.sheets.map(s => [s.sheetKey, s]));
-
-    const mappingCards = state.mappingPlan.tableMappings
-      .map((tblMap, mIdx) => {
-        const srcTable = profile.tables[tblMap.sourceIndex];
-        const tgtSchema = tblMap.targetSheetKey ? targetByKey.get(tblMap.targetSheetKey) : null;
-
-        const targetOptions = [
-          `<option value="" ${!tblMap.targetSheetKey ? 'selected' : ''}>不写进数据库（自动转入补充提示词）</option>`,
-          ...readRes.sheets.map(
-            s => `<option value="${escapeHtml(s.sheetKey)}" ${s.sheetKey === tblMap.targetSheetKey ? 'selected' : ''}>${escapeHtml(s.name)}（${s.isSingleRow ? '单行表' : '多行表'}，已有 ${s.existingRows.length} 行）</option>`
-          ),
+    if (cm.mode === 'constant') {
+      if (tCol.enumValues && tCol.enumValues.length > 0) {
+        const enumOpts = [
+          '<option value="">-- 选择合法值 --</option>',
+          ...tCol.enumValues.map(v => `<option value="${escapeHtml(v)}" ${String(cm.constantValue) === v ? 'selected' : ''}>${escapeHtml(v)}</option>`),
         ].join('');
+        return `<select class="text_pole pc-select-sm" data-pc-col-const="${mIdx}:${cIdx}">${enumOpts}</select>`;
+      }
+      return `<input type="text" class="text_pole pc-input-sm" data-pc-col-const="${mIdx}:${cIdx}" value="${escapeHtml(cm.constantValue ?? '')}" placeholder="输入固定填入的值" />`;
+    }
+    return `<span class="pc-muted">${tgtSchema.isSingleRow && tgtSchema.existingRows.length > 0 ? '保留新聊天此列原值' : '不写入此列'}</span>`;
+  }
 
-        let innerHtml = '';
-        if (!tgtSchema) {
-          innerHtml = `<div class="pc-muted pc-pad-sm">这张源表的内容不会被丢弃：执行时会汇总进下方的「跨聊天补充提示词」，可一键注入给新聊天的 AI。</div>`;
-        } else {
-          const ruleBadges = [
-            `<span class="pc-badge pc-badge-info">${tgtSchema.isSingleRow ? '单行表（仅允许1行）' : '多行表（可追加）'}</span>`,
-            tgtSchema.uniqueColumns.length > 0 ? `<span class="pc-badge pc-badge-warn">唯一键：${escapeHtml(tgtSchema.uniqueColumns.join('、'))}</span>` : '',
-            tgtSchema.columns.some(c => c.isNotNull) ? `<span class="pc-badge">含必填列</span>` : '',
-            tgtSchema.columns.some(c => c.enumValues) ? `<span class="pc-badge">含枚举限制</span>` : '',
-          ].join('');
+  function renderMapCardInnerHtml(profile, readRes, tblMap, mIdx) {
+    const srcTable = profile.tables[tblMap.sourceIndex];
+    const tgtSchema = tblMap.targetSheetKey ? readRes.sheets.find(s => s.sheetKey === tblMap.targetSheetKey) : null;
 
-          const strategyControl = tgtSchema.isSingleRow
-            ? `<label class="pc-inline-field">
-                <span>目标已有第 1 行时：</span>
-                <select class="text_pole pc-select-sm" data-pc-single-strategy="${mIdx}">
-                  <option value="update_existing" ${tblMap.singleRowStrategy === 'update_existing' ? 'selected' : ''}>更新覆盖第 1 行（只改下方映射的列）</option>
-                  <option value="skip_if_exists" ${tblMap.singleRowStrategy === 'skip_if_exists' ? 'selected' : ''}>保留原样，跳过写入</option>
-                </select>
-              </label>`
-            : `<label class="pc-inline-field">
-                <span>遇重名行（唯一键冲突）时：</span>
-                <select class="text_pole pc-select-sm" data-pc-dup-strategy="${mIdx}">
-                  <option value="update" ${tblMap.duplicateStrategy === 'update' ? 'selected' : ''}>覆盖更新已有行</option>
-                  <option value="skip" ${tblMap.duplicateStrategy === 'skip' ? 'selected' : ''}>跳过，保留新聊天原行</option>
-                  <option value="add_quantity" ${tblMap.duplicateStrategy === 'add_quantity' ? 'selected' : ''}>数量累加（适合背包物品）</option>
-                </select>
-              </label>`;
+    if (!tgtSchema) {
+      return `<div class="pc-muted pc-pad-sm">这张源表的内容不会被丢弃：执行时会汇总进下方的「跨聊天补充提示词」，可一键注入给新聊天的 AI。</div>`;
+    }
 
-          const colRows = tgtSchema.columns
-            .map((tCol, cIdx) => {
-              const cm = tblMap.columnMappings[tCol.header] || { mode: 'skip', sourceColumn: '', constantValue: '', combineColumns: [] };
-              const tags = [];
-              if (tCol.isNotNull) tags.push('<span class="pc-tag pc-tag-req">必填</span>');
-              if (tCol.isUnique) tags.push('<span class="pc-tag pc-tag-uniq">唯一</span>');
-              if (tCol.declaredType && tCol.declaredType !== 'TEXT') tags.push(`<span class="pc-tag">${escapeHtml(tCol.declaredType)}</span>`);
-              if (tCol.enumValues) tags.push(`<span class="pc-tag pc-tag-enum">仅限: ${escapeHtml(tCol.enumValues.join('/'))}</span>`);
-              if (tCol.minValue !== null) tags.push(`<span class="pc-tag">${tCol.minExclusive ? '>' : '>='}${tCol.minValue}</span>`);
-              if (tCol.hasDefault && tCol.defaultValue !== null) tags.push(`<span class="pc-tag">默认:${escapeHtml(tCol.defaultValue)}</span>`);
+    const ruleBadges = [
+      `<span class="pc-badge pc-badge-info">${tgtSchema.isSingleRow ? '单行表（仅允许1行）' : '多行表（可追加）'}</span>`,
+      tgtSchema.uniqueColumns.length > 0 ? `<span class="pc-badge pc-badge-warn">唯一键：${escapeHtml(tgtSchema.uniqueColumns.join('、'))}</span>` : '',
+      tgtSchema.columns.some(c => c.isNotNull) ? `<span class="pc-badge">含必填列</span>` : '',
+      tgtSchema.columns.some(c => c.enumValues) ? `<span class="pc-badge">含枚举限制</span>` : '',
+    ].join('');
 
-              let valueControl = '';
-              if (cm.mode === 'source_column') {
-                const srcOpts = [
-                  '<option value="">-- 请选择源列 --</option>',
-                  ...srcTable.headers.map(h => `<option value="${escapeHtml(h)}" ${h === cm.sourceColumn ? 'selected' : ''}>${escapeHtml(h)}</option>`),
-                ].join('');
-                const partBadge = cm.extractPart ? `<span class="pc-mini-hint">自动提取：${cm.extractPart === 'gender' ? '性别' : '年龄'}</span>` : '';
-                valueControl = `<select class="text_pole pc-select-sm" data-pc-col-src="${mIdx}:${cIdx}">${srcOpts}</select>${partBadge}`;
-              } else if (cm.mode === 'combine_columns') {
-                const cbs = srcTable.headers
-                  .map(
-                    h => `<label class="pc-chip"><input type="checkbox" data-pc-col-combine="${mIdx}:${cIdx}" value="${escapeHtml(h)}" ${(cm.combineColumns || []).includes(h) ? 'checked' : ''} />${escapeHtml(h)}</label>`
-                  )
-                  .join('');
-                valueControl = `<div class="pc-combine-wrap">${cbs}<input type="text" class="text_pole pc-joiner-input" data-pc-col-joiner="${mIdx}:${cIdx}" value="${escapeHtml(cm.joiner ?? '/')}" title="连接符号" /></div>`;
-              } else if (cm.mode === 'constant') {
-                if (tCol.enumValues && tCol.enumValues.length > 0) {
-                  const enumOpts = [
-                    '<option value="">-- 选择合法值 --</option>',
-                    ...tCol.enumValues.map(v => `<option value="${escapeHtml(v)}" ${String(cm.constantValue) === v ? 'selected' : ''}>${escapeHtml(v)}</option>`),
-                  ].join('');
-                  valueControl = `<select class="text_pole pc-select-sm" data-pc-col-const="${mIdx}:${cIdx}">${enumOpts}</select>`;
-                } else {
-                  valueControl = `<input type="text" class="text_pole pc-input-sm" data-pc-col-const="${mIdx}:${cIdx}" value="${escapeHtml(cm.constantValue ?? '')}" placeholder="输入固定填入的值" />`;
-                }
-              } else {
-                valueControl = `<span class="pc-muted">${tgtSchema.isSingleRow && tgtSchema.existingRows.length > 0 ? '保留新聊天此列原值' : '不写入此列'}</span>`;
-              }
+    const strategyControl = tgtSchema.isSingleRow
+      ? `<label class="pc-inline-field">
+          <span>目标已有第 1 行时：</span>
+          <select class="text_pole pc-select-sm" data-pc-single-strategy="${mIdx}">
+            <option value="update_existing" ${tblMap.singleRowStrategy === 'update_existing' ? 'selected' : ''}>更新覆盖第 1 行（只改下方映射的列）</option>
+            <option value="skip_if_exists" ${tblMap.singleRowStrategy === 'skip_if_exists' ? 'selected' : ''}>保留原样，跳过写入</option>
+          </select>
+        </label>`
+      : `<label class="pc-inline-field">
+          <span>遇重名行（唯一键冲突）时：</span>
+          <select class="text_pole pc-select-sm" data-pc-dup-strategy="${mIdx}">
+            <option value="update" ${tblMap.duplicateStrategy === 'update' ? 'selected' : ''}>覆盖更新已有行</option>
+            <option value="skip" ${tblMap.duplicateStrategy === 'skip' ? 'selected' : ''}>跳过，保留新聊天原行</option>
+            <option value="add_quantity" ${tblMap.duplicateStrategy === 'add_quantity' ? 'selected' : ''}>数量累加（适合背包物品）</option>
+          </select>
+        </label>`;
 
-              return `
-                <tr>
-                  <td>
-                    <div class="pc-col-name">${escapeHtml(tCol.header)}</div>
-                    <div class="pc-col-tags">${tags.join('')}</div>
-                  </td>
-                  <td>
-                    <select class="text_pole pc-select-sm" data-pc-col-mode="${mIdx}:${cIdx}">
-                      <option value="source_column" ${cm.mode === 'source_column' ? 'selected' : ''}>读取源列</option>
-                      <option value="combine_columns" ${cm.mode === 'combine_columns' ? 'selected' : ''}>合并多列</option>
-                      <option value="constant" ${cm.mode === 'constant' ? 'selected' : ''}>填入固定值</option>
-                      <option value="skip" ${cm.mode === 'skip' ? 'selected' : ''}>跳过不写</option>
-                    </select>
-                  </td>
-                  <td>${valueControl}</td>
-                </tr>
-              `;
-            })
-            .join('');
-
-          innerHtml = `
-            <div class="pc-rule-bar">
-              <div class="pc-badges">${ruleBadges}</div>
-              ${strategyControl}
-            </div>
-            ${tgtSchema.noteSummary ? `<details class="pc-note-details" data-pc-details-key="map-note-${mIdx}"><summary>查看目标表原规则说明：${escapeHtml(tgtSchema.noteSummary)}</summary><pre class="pc-note-pre">${escapeHtml(tgtSchema.note)}</pre></details>` : ''}
-            <div class="pc-table-scroll" data-pc-scroll-key="map-sheet-${mIdx}">
-              <table class="pc-map-table">
-                <thead>
-                  <tr>
-                    <th style="width:32%;">目标聊天的列与规则</th>
-                    <th style="width:22%;">写入方式</th>
-                    <th>来源列 / 数值</th>
-                  </tr>
-                </thead>
-                <tbody>${colRows}</tbody>
-              </table>
-            </div>
-          `;
-        }
+    const colRows = tgtSchema.columns
+      .map((tCol, cIdx) => {
+        const cm = tblMap.columnMappings[tCol.header] || { mode: 'skip', sourceColumn: '', constantValue: '', combineColumns: [] };
+        const tags = [];
+        if (tCol.isNotNull) tags.push('<span class="pc-tag pc-tag-req">必填</span>');
+        if (tCol.isUnique) tags.push('<span class="pc-tag pc-tag-uniq">唯一</span>');
+        if (tCol.declaredType && tCol.declaredType !== 'TEXT') tags.push(`<span class="pc-tag">${escapeHtml(tCol.declaredType)}</span>`);
+        if (tCol.enumValues) tags.push(`<span class="pc-tag pc-tag-enum">仅限: ${escapeHtml(tCol.enumValues.join('/'))}</span>`);
+        if (tCol.minValue !== null) tags.push(`<span class="pc-tag">${tCol.minExclusive ? '>' : '>='}${tCol.minValue}</span>`);
+        if (tCol.hasDefault && tCol.defaultValue !== null) tags.push(`<span class="pc-tag">默认:${escapeHtml(tCol.defaultValue)}</span>`);
 
         return `
-          <div class="pc-card pc-map-card">
-            <div class="pc-map-head">
-              <div>
-                <span class="pc-src-pill">源表：${escapeHtml(srcTable.name)}（${srcTable.rows.length} 行）</span>
-                <span class="pc-arrow">→</span>
-              </div>
-              <select class="text_pole" data-pc-target-sheet="${mIdx}">${targetOptions}</select>
-            </div>
-            ${innerHtml}
-          </div>
+          <tr>
+            <td>
+              <div class="pc-col-name">${escapeHtml(tCol.header)}</div>
+              <div class="pc-col-tags">${tags.join('')}</div>
+            </td>
+            <td>
+              <select class="text_pole pc-select-sm" data-pc-col-mode="${mIdx}:${cIdx}">
+                <option value="source_column" ${cm.mode === 'source_column' ? 'selected' : ''}>读取源列</option>
+                <option value="combine_columns" ${cm.mode === 'combine_columns' ? 'selected' : ''}>合并多列</option>
+                <option value="constant" ${cm.mode === 'constant' ? 'selected' : ''}>填入固定值</option>
+                <option value="skip" ${cm.mode === 'skip' ? 'selected' : ''}>跳过不写</option>
+              </select>
+            </td>
+            <td data-pc-col-val-cell="${mIdx}:${cIdx}">
+              ${renderColumnValueControlHtml(srcTable, tgtSchema, tCol, cm, mIdx, cIdx)}
+            </td>
+          </tr>
         `;
       })
       .join('');
 
+    return `
+      <div class="pc-rule-bar">
+        <div class="pc-badges">${ruleBadges}</div>
+        ${strategyControl}
+      </div>
+      ${tgtSchema.noteSummary ? `<details class="pc-note-details"><summary>查看目标表原规则说明：${escapeHtml(tgtSchema.noteSummary)}</summary><pre class="pc-note-pre">${escapeHtml(tgtSchema.note)}</pre></details>` : ''}
+      <div class="pc-table-scroll">
+        <table class="pc-map-table">
+          <thead>
+            <tr>
+              <th style="width:32%;">目标聊天的列与规则</th>
+              <th style="width:22%;">写入方式</th>
+              <th>来源列 / 数值</th>
+            </tr>
+          </thead>
+          <tbody>${colRows}</tbody>
+        </table>
+      </div>
+    `;
+  }
+
+  function renderPreflightSectionHtml(profile, readRes) {
+    const compiled = compileWritePlan(profile, readRes.tableData, state.mappingPlan);
+    const totalOps = compiled.operations.length;
+    const limit = state.showAllOps ? totalOps : Math.min(totalOps, PAGE_SIZE_OPS);
+
     const opPreviewRows = compiled.operations
+      .slice(0, limit)
       .map(op => {
         const actionLabel = op.action === 'insert' ? '新增行' : op.action === 'update' ? `更新第 ${op.targetRowIndex} 行` : '跳过';
         const statusCls = op.errors.length > 0 ? 'pc-op-err' : op.warnings.length > 0 ? 'pc-op-warn' : 'pc-op-ok';
@@ -775,6 +806,11 @@ export function createWorkbenchController({ getContext }) {
         `;
       })
       .join('');
+
+    const moreOpsHtml =
+      totalOps > limit
+        ? `<div class="pc-pager"><span class="pc-muted">已预览前 ${limit} / ${totalOps} 条操作</span><button type="button" class="pc-link-btn" data-pc-show-all-ops>展开全部 ${totalOps} 条</button></div>`
+        : '';
 
     const overflowBox = compiled.summary.hasOverflow
       ? `
@@ -801,6 +837,7 @@ export function createWorkbenchController({ getContext }) {
           ${state.lastWriteReceipt.error ? `<div class="pc-err-line">${escapeHtml(state.lastWriteReceipt.error)}</div>` : ''}
           <ul class="pc-receipt-list">
             ${state.lastWriteReceipt.results
+              .slice(0, 50)
               .map(r => `<li class="${r.ok ? 'pc-ok' : 'pc-err'}">[${escapeHtml(r.tableName)}] ${escapeHtml(r.detail)}</li>`)
               .join('')}
           </ul>
@@ -811,8 +848,6 @@ export function createWorkbenchController({ getContext }) {
     const canClickExecute = compiled.canExecute && readRes.floorState.hasAiFloor;
 
     return `
-      <div class="pc-section-title">跨表规则映射（已自动按当前聊天表结构对齐，可随时手动改）</div>
-      ${mappingCards}
       <div class="pc-card pc-preflight-card">
         <div class="pc-preflight-summary">
           <strong>写前规则体检：</strong>
@@ -822,7 +857,7 @@ export function createWorkbenchController({ getContext }) {
           <span class="${compiled.summary.warnings > 0 ? 'pc-warn' : 'pc-muted'}">提示 ${compiled.summary.warnings} 条</span> ·
           <span class="${compiled.summary.errors > 0 ? 'pc-err' : 'pc-ok'}">错误 ${compiled.summary.errors} 条</span>
         </div>
-        <div class="pc-op-list" data-pc-scroll-key="op-list">${opPreviewRows || '<div class="pc-muted">当前没有计划写入数据库的行（全部已转入下方补充提示词）。</div>'}</div>
+        <div class="pc-op-list">${opPreviewRows || '<div class="pc-muted">当前没有计划写入数据库的行（全部已转入下方补充提示词）。</div>'}${moreOpsHtml}</div>
       </div>
       ${overflowBox}
       ${receiptBox}
@@ -843,6 +878,70 @@ export function createWorkbenchController({ getContext }) {
         </div>
       </div>
     `;
+  }
+
+  function renderDbWritebackSection(profile, readRes) {
+    if (!readRes.ok) {
+      return `
+        <div class="pc-empty">
+          <p>${escapeHtml(readRes.reason)}</p>
+          <p class="pc-muted">如果当前角色卡本身没有使用龙血玄黄数据库，直接切到「模式 B：纯提示词注入」一样可以让 AI 记住你的主角！</p>
+          <button type="button" class="menu_button pc-btn-primary" data-pc-inherit-mode="prompt">切换到纯提示词注入</button>
+        </div>
+      `;
+    }
+
+    if (!state.mappingPlan) {
+      state.mappingPlan = buildDefaultMappingPlan(profile, readRes.tableData);
+    }
+
+    const mappingCards = state.mappingPlan.tableMappings
+      .map((tblMap, mIdx) => {
+        const srcTable = profile.tables[tblMap.sourceIndex];
+        const targetOptions = [
+          `<option value="" ${!tblMap.targetSheetKey ? 'selected' : ''}>不写进数据库（自动转入补充提示词）</option>`,
+          ...readRes.sheets.map(
+            s => `<option value="${escapeHtml(s.sheetKey)}" ${s.sheetKey === tblMap.targetSheetKey ? 'selected' : ''}>${escapeHtml(s.name)}（${s.isSingleRow ? '单行表' : '多行表'}，已有 ${s.existingRows.length} 行）</option>`
+          ),
+        ].join('');
+
+        return `
+          <div class="pc-card pc-map-card" data-pc-map-card="${mIdx}">
+            <div class="pc-map-head">
+              <div>
+                <span class="pc-src-pill">源表：${escapeHtml(srcTable.name)}（${srcTable.rows.length} 行）</span>
+                <span class="pc-arrow">→</span>
+              </div>
+              <select class="text_pole" data-pc-target-sheet="${mIdx}">${targetOptions}</select>
+            </div>
+            <div data-pc-map-inner="${mIdx}">${renderMapCardInnerHtml(profile, readRes, tblMap, mIdx)}</div>
+          </div>
+        `;
+      })
+      .join('');
+
+    return `
+      <div class="pc-section-title">跨表规则映射（已自动按当前聊天表结构对齐，可随时手动改）</div>
+      ${mappingCards}
+      <div data-pc-preflight-host class="pc-stack">${renderPreflightSectionHtml(profile, readRes)}</div>
+    `;
+  }
+
+  /** 局部补丁：只更新体检区与底部按钮，不重建任何映射卡片、不移动滚动条 */
+  function patchPreflightOnly() {
+    const bodyEl = getBodyEl();
+    const host = bodyEl?.querySelector('[data-pc-preflight-host]');
+    const profile = getSelectedProfile();
+    if (!host || !profile || !state.targetReadResult?.ok) return;
+    host.innerHTML = renderPreflightSectionHtml(profile, state.targetReadResult);
+  }
+
+  function schedulePreflightPatch() {
+    if (preflightDebounceTimer) clearTimeout(preflightDebounceTimer);
+    preflightDebounceTimer = setTimeout(() => {
+      preflightDebounceTimer = null;
+      patchPreflightOnly();
+    }, 120);
   }
 
   function renderPromptInjectSection(profile, identity, binding) {
@@ -896,7 +995,7 @@ export function createWorkbenchController({ getContext }) {
       <div class="pc-card pc-toolbar">
         <div class="pc-toolbar-info">
           <strong>已保存的主角传承档案（共 ${state.profiles.length} 份）</strong>
-          <div class="pc-muted">保存在浏览器本地，支持随时导出成 JSON 文件备份或发到另一台设备导入。</div>
+          <div class="pc-muted">保存在本地存储，支持随时导出成 JSON 文件备份或发到另一台设备导入。</div>
         </div>
         <div class="pc-toolbar-btns">
           <label class="menu_button pc-file-btn">
@@ -939,23 +1038,18 @@ export function createWorkbenchController({ getContext }) {
     return `${topBar}${cards}`;
   }
 
-  /* ===================== 事件绑定（仅绑定 .pc-body 内动态节点） ===================== */
-  function bindBodyEvents(bodyEl) {
-    if (!bodyEl) return;
+  /* ===================== 统一事件委托（零重绑、零跳顶） ===================== */
+  async function handleBodyClick(evt) {
+    const target = evt.target.closest('button');
+    if (!target) return;
 
-    bodyEl.querySelectorAll('[data-pc-tab]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        state.activeTab = btn.dataset.pcTab;
-        state.lastWriteReceipt = null;
-        if (state.activeTab === 'inherit') {
-          refreshTargetContextForInherit({ resetMapping: true });
-        }
-        renderModal({ resetScroll: true });
-      });
-    });
+    if (target.dataset.pcJumpTab) {
+      switchTab(target.dataset.pcJumpTab);
+      return;
+    }
 
-    // Tab 1 events
-    bodyEl.querySelector('[data-pc-read-current]')?.addEventListener('click', () => {
+    // Tab 1 buttons
+    if (target.hasAttribute('data-pc-read-current')) {
       const readRes = readCurrentChatAcuTables(getContext());
       if (!readRes.ok) {
         notifyToast('warning', readRes.reason);
@@ -963,83 +1057,38 @@ export function createWorkbenchController({ getContext }) {
       }
       state.exportDraft = buildExportDraftFromSheets(readRes.sheets, readRes.identity.displayLabel);
       notifyToast('success', `已读取当前聊天数据库，共 ${readRes.sheets.length} 张表。`);
-      renderModal();
-    });
+      renderCurrentTab({ resetScroll: false });
+      return;
+    }
 
-    modalEl.querySelector('[data-pc-upload-source]')?.addEventListener('change', async (evt) => {
-      const file = evt.target.files?.[0];
-      if (!file) return;
-      try {
-        const text = await file.text();
-        const parsed = parseImportedSourceJson(text);
-        if (parsed.kind === 'carryover_archive') {
-          for (const p of parsed.profiles) {
-            await upsertProfile(getContext(), p);
-          }
-          await refreshProfiles();
-          state.activeTab = 'library';
-          notifyToast('success', `已导入 ${parsed.profiles.length} 份主角传承档案。`);
-          renderModal();
-          return;
-        }
-        const sheets = extractSheetsFromTableData(parsed.tableData);
-        state.exportDraft = buildExportDraftFromSheets(sheets, file.name);
-        notifyToast('success', `已解析 ${file.name}，共 ${sheets.length} 张表。`);
-        renderModal();
-      } catch (err) {
-        notifyToast('error', err?.message || String(err));
-      }
-    });
+    if (target.dataset.pcSheetExpand !== undefined) {
+      const sIdx = Number(target.dataset.pcSheetExpand);
+      const s = state.exportDraft?.sheets[sIdx];
+      if (!s) return;
+      s.expanded = !s.expanded;
+      patchSheetBody(sIdx);
+      return;
+    }
 
-    modalEl.querySelector('[data-pc-draft-name]')?.addEventListener('input', (evt) => {
-      if (state.exportDraft) state.exportDraft.name = evt.target.value;
-    });
-    modalEl.querySelector('[data-pc-draft-source]')?.addEventListener('input', (evt) => {
-      if (state.exportDraft) state.exportDraft.sourceLabel = evt.target.value;
-    });
-    modalEl.querySelector('[data-pc-draft-note]')?.addEventListener('input', (evt) => {
-      if (state.exportDraft) state.exportDraft.note = evt.target.value;
-    });
+    if (target.dataset.pcSheetMore !== undefined) {
+      const sIdx = Number(target.dataset.pcSheetMore);
+      const s = state.exportDraft?.sheets[sIdx];
+      if (!s) return;
+      s.visibleLimit = (s.visibleLimit || PAGE_SIZE_ROWS) + PAGE_SIZE_ROWS;
+      patchSheetBody(sIdx);
+      return;
+    }
 
-    modalEl.querySelectorAll('[data-pc-sheet-toggle]').forEach(cb => {
-      cb.addEventListener('change', () => {
-        const sIdx = Number(cb.dataset.pcSheetToggle);
-        if (!state.exportDraft?.sheets[sIdx]) return;
-        state.exportDraft.sheets[sIdx].selected = cb.checked;
-        if (cb.checked) state.exportDraft.sheets[sIdx].expanded = true;
-        renderModal();
-      });
-    });
+    if (target.dataset.pcSheetAll !== undefined) {
+      const sIdx = Number(target.dataset.pcSheetAll);
+      const s = state.exportDraft?.sheets[sIdx];
+      if (!s) return;
+      s.visibleLimit = s.rows.length;
+      patchSheetBody(sIdx);
+      return;
+    }
 
-    modalEl.querySelectorAll('[data-pc-sheet-expand]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const sIdx = Number(btn.dataset.pcSheetExpand);
-        if (!state.exportDraft?.sheets[sIdx]) return;
-        state.exportDraft.sheets[sIdx].expanded = !state.exportDraft.sheets[sIdx].expanded;
-        renderModal();
-      });
-    });
-
-    modalEl.querySelectorAll('[data-pc-row-toggle]').forEach(cb => {
-      cb.addEventListener('change', () => {
-        const [sIdx, rIdx] = cb.dataset.pcRowToggle.split(':').map(Number);
-        if (!state.exportDraft?.sheets[sIdx]?.rows[rIdx]) return;
-        state.exportDraft.sheets[sIdx].rows[rIdx].selected = cb.checked;
-        renderModal();
-      });
-    });
-
-    modalEl.querySelectorAll('[data-pc-cell]').forEach(input => {
-      input.addEventListener('input', () => {
-        const [sIdx, rIdx, cIdx] = input.dataset.pcCell.split(':').map(Number);
-        const sheet = state.exportDraft?.sheets[sIdx];
-        if (!sheet?.rows[rIdx]) return;
-        const header = sheet.headers[cIdx];
-        sheet.rows[rIdx].values[header] = input.value;
-      });
-    });
-
-    modalEl.querySelector('[data-pc-save-profile]')?.addEventListener('click', async () => {
+    if (target.hasAttribute('data-pc-save-profile')) {
       if (!state.exportDraft) return;
       const selectedTables = state.exportDraft.sheets
         .filter(s => s.selected)
@@ -1072,166 +1121,65 @@ export function createWorkbenchController({ getContext }) {
       state.profiles = saved.profiles;
       state.selectedProfileId = saved.profile.id;
       state.exportDraft.editingProfileId = saved.profile.id;
-      state.activeTab = 'inherit';
-      state.lastWriteReceipt = null;
-      refreshTargetContextForInherit({ resetMapping: true });
       notifyToast('success', `主角「${saved.profile.name}」已保存到传承库！现在可以切到新聊天继承了。`);
-      renderModal({ resetScroll: true });
-    });
+      switchTab('inherit');
+      return;
+    }
 
-    // Tab 2 events
-    modalEl.querySelector('[data-pc-select-profile]')?.addEventListener('change', (evt) => {
-      state.selectedProfileId = evt.target.value;
+    // Tab 2 buttons
+    if (target.hasAttribute('data-pc-refresh-target')) {
       state.lastWriteReceipt = null;
       refreshTargetContextForInherit({ resetMapping: true });
-      renderModal();
-    });
+      renderCurrentTab({ resetScroll: false });
+      return;
+    }
 
-    modalEl.querySelector('[data-pc-refresh-target]')?.addEventListener('click', () => {
-      state.lastWriteReceipt = null;
-      refreshTargetContextForInherit({ resetMapping: true });
-      renderModal();
-    });
-
-    modalEl.querySelectorAll('[data-pc-inherit-mode]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        state.inheritMode = btn.dataset.pcInheritMode;
-        if (state.inheritMode === 'db' && state.targetReadResult?.ok && !state.mappingPlan) {
-          state.mappingPlan = buildDefaultMappingPlan(getSelectedProfile(), state.targetReadResult.tableData);
-        }
-        renderModal();
-      });
-    });
-
-    modalEl.querySelectorAll('[data-pc-target-sheet]').forEach(sel => {
-      sel.addEventListener('change', () => {
-        const mIdx = Number(sel.dataset.pcTargetSheet);
-        const tblMap = state.mappingPlan?.tableMappings[mIdx];
-        const profile = getSelectedProfile();
-        if (!tblMap || !profile) return;
-        const newKey = sel.value || null;
-        tblMap.targetSheetKey = newKey;
-        const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === newKey) || null;
-        tblMap.columnMappings = tgtSchema
-          ? buildDefaultColumnMappings(profile.tables[tblMap.sourceIndex], tgtSchema)
-          : {};
-        renderModal();
-      });
-    });
-
-    modalEl.querySelectorAll('[data-pc-single-strategy]').forEach(sel => {
-      sel.addEventListener('change', () => {
-        const mIdx = Number(sel.dataset.pcSingleStrategy);
-        if (state.mappingPlan?.tableMappings[mIdx]) {
-          state.mappingPlan.tableMappings[mIdx].singleRowStrategy = sel.value;
-          renderModal();
-        }
-      });
-    });
-
-    modalEl.querySelectorAll('[data-pc-dup-strategy]').forEach(sel => {
-      sel.addEventListener('change', () => {
-        const mIdx = Number(sel.dataset.pcDupStrategy);
-        if (state.mappingPlan?.tableMappings[mIdx]) {
-          state.mappingPlan.tableMappings[mIdx].duplicateStrategy = sel.value;
-          renderModal();
-        }
-      });
-    });
-
-    modalEl.querySelectorAll('[data-pc-col-mode]').forEach(sel => {
-      sel.addEventListener('change', () => {
-        const [mIdx, cIdx] = sel.dataset.pcColMode.split(':').map(Number);
-        const tblMap = state.mappingPlan?.tableMappings[mIdx];
-        const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === tblMap?.targetSheetKey);
-        const colHeader = tgtSchema?.columns[cIdx]?.header;
-        if (!tblMap || !colHeader) return;
-        const prev = tblMap.columnMappings[colHeader] || {};
-        tblMap.columnMappings[colHeader] = {
-          mode: sel.value,
-          sourceColumn: prev.sourceColumn || '',
-          extractPart: null,
-          combineColumns: Array.isArray(prev.combineColumns) ? prev.combineColumns : [],
-          joiner: prev.joiner ?? '/',
-          constantValue: prev.constantValue ?? '',
-        };
-        renderModal();
-      });
-    });
-
-    modalEl.querySelectorAll('[data-pc-col-src]').forEach(sel => {
-      sel.addEventListener('change', () => {
-        const [mIdx, cIdx] = sel.dataset.pcColSrc.split(':').map(Number);
-        const tblMap = state.mappingPlan?.tableMappings[mIdx];
-        const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === tblMap?.targetSheetKey);
-        const colHeader = tgtSchema?.columns[cIdx]?.header;
-        if (!tblMap || !colHeader) return;
-        tblMap.columnMappings[colHeader].sourceColumn = sel.value;
-        tblMap.columnMappings[colHeader].extractPart = null;
-        renderModal();
-      });
-    });
-
-    modalEl.querySelectorAll('[data-pc-col-const]').forEach(el => {
-      const updateConst = (shouldRender) => {
-        const [mIdx, cIdx] = el.dataset.pcColConst.split(':').map(Number);
-        const tblMap = state.mappingPlan?.tableMappings[mIdx];
-        const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === tblMap?.targetSheetKey);
-        const colHeader = tgtSchema?.columns[cIdx]?.header;
-        if (!tblMap || !colHeader) return;
-        tblMap.columnMappings[colHeader].constantValue = el.value;
-        if (shouldRender) renderModal();
-      };
-      if (el.tagName !== 'SELECT') {
-        el.addEventListener('input', () => updateConst(false));
+    if (target.dataset.pcInheritMode) {
+      state.inheritMode = target.dataset.pcInheritMode;
+      const profile = getSelectedProfile();
+      if (state.inheritMode === 'db' && state.targetReadResult?.ok && !state.mappingPlan && profile) {
+        state.mappingPlan = buildDefaultMappingPlan(profile, state.targetReadResult.tableData);
       }
-      el.addEventListener('change', () => updateConst(true));
-    });
-
-    modalEl.querySelectorAll('[data-pc-col-combine]').forEach(cb => {
-      cb.addEventListener('change', () => {
-        const [mIdx, cIdx] = cb.dataset.pcColCombine.split(':').map(Number);
-        const tblMap = state.mappingPlan?.tableMappings[mIdx];
-        const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === tblMap?.targetSheetKey);
-        const colHeader = tgtSchema?.columns[cIdx]?.header;
-        if (!tblMap || !colHeader) return;
-        const list = new Set(tblMap.columnMappings[colHeader].combineColumns || []);
-        if (cb.checked) list.add(cb.value);
-        else list.delete(cb.value);
-        tblMap.columnMappings[colHeader].combineColumns = [...list];
-        renderModal();
+      const bodyEl = getBodyEl();
+      bodyEl?.querySelectorAll('.pc-mode-btn').forEach(btn => {
+        btn.classList.toggle('is-active', btn.dataset.pcInheritMode === state.inheritMode);
       });
-    });
+      const host = bodyEl?.querySelector('[data-pc-inherit-mode-host]');
+      if (host && profile && state.targetReadResult) {
+        const identity = state.targetReadResult.identity;
+        const binding = getChatBinding(getContext(), identity.bindingKey);
+        host.innerHTML =
+          state.inheritMode === 'db'
+            ? renderDbWritebackSection(profile, state.targetReadResult)
+            : renderPromptInjectSection(profile, identity, binding);
+      }
+      return;
+    }
 
-    modalEl.querySelectorAll('[data-pc-col-joiner]').forEach(inp => {
-      inp.addEventListener('change', () => {
-        const [mIdx, cIdx] = inp.dataset.pcColJoiner.split(':').map(Number);
-        const tblMap = state.mappingPlan?.tableMappings[mIdx];
-        const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === tblMap?.targetSheetKey);
-        const colHeader = tgtSchema?.columns[cIdx]?.header;
-        if (!tblMap || !colHeader) return;
-        tblMap.columnMappings[colHeader].joiner = inp.value;
-        renderModal();
-      });
-    });
+    if (target.hasAttribute('data-pc-show-all-ops')) {
+      state.showAllOps = true;
+      patchPreflightOnly();
+      return;
+    }
 
-    modalEl.querySelector('[data-pc-toggle-overflow]')?.addEventListener('change', (evt) => {
-      state.alsoInjectOverflow = evt.target.checked;
-    });
-
-    modalEl.querySelector('[data-pc-apply-overflow-only]')?.addEventListener('click', () => {
+    if (target.hasAttribute('data-pc-apply-overflow-only')) {
       const profile = getSelectedProfile();
       const ctx = getContext();
       if (!profile || !state.targetReadResult?.ok) return;
       const compiled = compileWritePlan(profile, state.targetReadResult.tableData, state.mappingPlan);
       applyOverflowBinding(ctx, profile, compiled.overflowText);
-      renderModal();
-    });
+      notifyToast('success', `已将主角「${profile.name}」的补充传承信息注入当前聊天。`);
+      patchInheritStatusMeta();
+      patchPreflightOnly();
+      return;
+    }
 
-    modalEl.querySelector('[data-pc-execute-db]')?.addEventListener('click', async () => {
+    if (target.hasAttribute('data-pc-execute-db')) {
       const profile = getSelectedProfile();
       const ctx = getContext();
       if (!profile || !state.targetReadResult?.ok || !state.mappingPlan) return;
+      target.disabled = true;
+      target.textContent = '正在写入数据库…';
       const compiled = compileWritePlan(profile, state.targetReadResult.tableData, state.mappingPlan);
       const receipt = await executeCompiledWritePlan(compiled, ctx);
       state.lastWriteReceipt = receipt;
@@ -1248,32 +1196,23 @@ export function createWorkbenchController({ getContext }) {
         notifyToast('error', receipt.error || '写入失败，请查看下方回执明细。');
       }
 
-      // 写完后刷新目标表视图
       state.targetReadResult = readCurrentChatAcuTables(ctx);
       updateSettingsDrawerStatus();
-      renderModal();
-    });
+      patchInheritStatusMeta();
+      patchPreflightOnly();
+      return;
+    }
 
-    // Tab 2: Prompt Injection events
-    modalEl.querySelector('[data-pc-prompt-pos]')?.addEventListener('change', (evt) => {
-      state.promptPosition = evt.target.value;
-    });
-    modalEl.querySelector('[data-pc-prompt-depth]')?.addEventListener('input', (evt) => {
-      state.promptDepth = Number(evt.target.value || 0);
-    });
-    modalEl.querySelector('[data-pc-prompt-role]')?.addEventListener('change', (evt) => {
-      state.promptRole = evt.target.value;
-    });
-    modalEl.querySelector('[data-pc-prompt-text]')?.addEventListener('input', (evt) => {
-      state.promptDraftText = evt.target.value;
-    });
-    modalEl.querySelector('[data-pc-regen-prompt]')?.addEventListener('click', () => {
+    if (target.hasAttribute('data-pc-regen-prompt')) {
       const profile = getSelectedProfile();
       if (!profile) return;
       state.promptDraftText = formatTablesAsCarryoverText(profile.name, profile.tables, profile.note);
-      renderModal();
-    });
-    modalEl.querySelector('[data-pc-apply-prompt]')?.addEventListener('click', () => {
+      const ta = getBodyEl()?.querySelector('[data-pc-prompt-text]');
+      if (ta) ta.value = state.promptDraftText;
+      return;
+    }
+
+    if (target.hasAttribute('data-pc-apply-prompt')) {
       const profile = getSelectedProfile();
       const ctx = getContext();
       const identity = getCurrentChatIdentity(ctx);
@@ -1300,21 +1239,79 @@ export function createWorkbenchController({ getContext }) {
       const res = applyChatPromptInjection(ctx, binding, identity.bindingKey);
       updateSettingsDrawerStatus();
       notifyToast('success', `已将主角「${binding.profileName}」注入到当前聊天（通道：${res.channel === 'native_setExtensionPrompt' ? '原生扩展提示词' : '生成拦截器兜底'}）。`);
-      renderModal();
-    });
-    modalEl.querySelector('[data-pc-clear-prompt]')?.addEventListener('click', () => {
+      patchInheritStatusMeta();
+      const host = getBodyEl()?.querySelector('[data-pc-inherit-mode-host]');
+      if (host) host.innerHTML = renderPromptInjectSection(profile, identity, binding);
+      return;
+    }
+
+    if (target.hasAttribute('data-pc-clear-prompt')) {
       const ctx = getContext();
       const identity = getCurrentChatIdentity(ctx);
       setChatBinding(ctx, identity.bindingKey, null);
       clearPromptInjection(ctx);
       updateSettingsDrawerStatus();
       notifyToast('info', '已取消当前聊天的主角提示词绑定。');
-      renderModal();
-    });
+      patchInheritStatusMeta();
+      const host = getBodyEl()?.querySelector('[data-pc-inherit-mode-host]');
+      if (host) host.innerHTML = renderPromptInjectSection(getSelectedProfile(), identity, null);
+      return;
+    }
 
-    // Tab 3: Library events
-    modalEl.querySelector('[data-pc-import-archive]')?.addEventListener('change', async (evt) => {
-      const file = evt.target.files?.[0];
+    // Tab 3 buttons
+    if (target.hasAttribute('data-pc-export-all')) {
+      if (state.profiles.length === 0) return;
+      const json = serializeProfilesArchive(state.profiles);
+      triggerJsonDownload(`protagonist_carryover_all_${Date.now()}.json`, json);
+      notifyToast('success', '已导出全部主角传承库备份。');
+      return;
+    }
+
+    if (target.dataset.pcLibInherit) {
+      state.selectedProfileId = target.dataset.pcLibInherit;
+      switchTab('inherit');
+      return;
+    }
+
+    if (target.dataset.pcLibEdit) {
+      const profile = state.profiles.find(p => p.id === target.dataset.pcLibEdit);
+      if (!profile) return;
+      state.exportDraft = buildExportDraftFromProfile(profile);
+      switchTab('export');
+      return;
+    }
+
+    if (target.dataset.pcLibExport) {
+      const profile = state.profiles.find(p => p.id === target.dataset.pcLibExport);
+      if (!profile) return;
+      const safeName = profile.name.replace(/[\\/:*?"<>|]+/g, '_') || 'protagonist';
+      triggerJsonDownload(`protagonist_${safeName}.json`, serializeProfilesArchive([profile]));
+      return;
+    }
+
+    if (target.dataset.pcLibDelete) {
+      const id = target.dataset.pcLibDelete;
+      const profile = state.profiles.find(p => p.id === id);
+      if (!profile) return;
+      if (!globalThis.confirm(`确定要从传承库删除主角「${profile.name}」吗？（不会影响已写入任何聊天的记录）`)) {
+        return;
+      }
+      state.profiles = await deleteProfile(getContext(), id);
+      if (state.selectedProfileId === id) {
+        state.selectedProfileId = state.profiles[0]?.id || '';
+      }
+      notifyToast('info', `已删除主角「${profile.name}」。`);
+      renderCurrentTab({ resetScroll: false });
+    }
+  }
+
+  async function handleBodyChange(evt) {
+    const el = evt.target;
+    if (!el) return;
+
+    // 文件上传：Tab 1 导出源 / Tab 3 导入档案
+    if (el.hasAttribute('data-pc-upload-source') || el.hasAttribute('data-pc-import-archive')) {
+      const file = el.files?.[0];
       if (!file) return;
       try {
         const text = await file.text();
@@ -1325,71 +1322,251 @@ export function createWorkbenchController({ getContext }) {
           }
           await refreshProfiles();
           notifyToast('success', `已导入 ${parsed.profiles.length} 份主角传承档案。`);
-          renderModal();
+          switchTab('library');
         } else {
           const sheets = extractSheetsFromTableData(parsed.tableData);
           state.exportDraft = buildExportDraftFromSheets(sheets, file.name);
+          notifyToast('success', `已解析 ${file.name}，共 ${sheets.length} 张表。`);
           state.activeTab = 'export';
-          notifyToast('info', '识别为数据库文件，已转到「导出主角」页供你勾选导出。');
-          renderModal();
+          renderCurrentTab({ resetScroll: false });
         }
       } catch (err) {
         notifyToast('error', err?.message || String(err));
       }
-    });
+      return;
+    }
 
-    modalEl.querySelector('[data-pc-export-all]')?.addEventListener('click', () => {
-      if (state.profiles.length === 0) return;
-      const json = serializeProfilesArchive(state.profiles);
-      triggerJsonDownload(`protagonist_carryover_all_${Date.now()}.json`, json);
-      notifyToast('success', '已导出全部主角传承库备份。');
-    });
+    // Tab 1: 勾选整张表（纯原地 DOM 补丁，0 闪烁、0 跳顶）
+    if (el.dataset.pcSheetToggle !== undefined) {
+      const sIdx = Number(el.dataset.pcSheetToggle);
+      const s = state.exportDraft?.sheets[sIdx];
+      if (!s) return;
+      s.selected = el.checked;
+      const card = getBodyEl()?.querySelector(`[data-pc-sheet-card="${sIdx}"]`);
+      card?.classList.toggle('is-selected', s.selected);
+      if (s.selected && !s.expanded) {
+        s.expanded = true;
+        patchSheetBody(sIdx);
+      } else if (card) {
+        card.querySelectorAll('[data-pc-row-toggle]').forEach(rcb => {
+          rcb.disabled = !s.selected;
+          const rIdx = Number(rcb.dataset.pcRowToggle.split(':')[1]);
+          const rowActive = s.selected && Boolean(s.rows[rIdx]?.selected);
+          const tr = rcb.closest('tr');
+          tr?.querySelectorAll('.pc-cell-input').forEach(inp => {
+            inp.disabled = !rowActive;
+          });
+        });
+      }
+      patchExportCounts(sIdx);
+      return;
+    }
 
-    modalEl.querySelectorAll('[data-pc-lib-inherit]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        state.selectedProfileId = btn.dataset.pcLibInherit;
-        state.activeTab = 'inherit';
-        state.lastWriteReceipt = null;
-        refreshTargetContextForInherit({ resetMapping: true });
-        renderModal({ resetScroll: true });
+    // Tab 1: 勾选单行（纯原地 DOM 补丁，0.05ms 完成）
+    if (el.dataset.pcRowToggle !== undefined) {
+      const [sIdx, rIdx] = el.dataset.pcRowToggle.split(':').map(Number);
+      const s = state.exportDraft?.sheets[sIdx];
+      if (!s?.rows[rIdx]) return;
+      s.rows[rIdx].selected = el.checked;
+      const tr = el.closest('tr');
+      tr?.classList.toggle('pc-row-dim', !el.checked);
+      const inputsEnabled = s.selected && el.checked;
+      tr?.querySelectorAll('.pc-cell-input').forEach(inp => {
+        inp.disabled = !inputsEnabled;
       });
-    });
+      patchExportCounts(sIdx);
+      return;
+    }
 
-    modalEl.querySelectorAll('[data-pc-lib-edit]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const profile = state.profiles.find(p => p.id === btn.dataset.pcLibEdit);
-        if (!profile) return;
-        state.exportDraft = buildExportDraftFromProfile(profile);
-        state.activeTab = 'export';
-        renderModal({ resetScroll: true });
-      });
-    });
+    // Tab 2: 切换主角档案
+    if (el.hasAttribute('data-pc-select-profile')) {
+      state.selectedProfileId = el.value;
+      state.lastWriteReceipt = null;
+      refreshTargetContextForInherit({ resetMapping: true });
+      renderCurrentTab({ resetScroll: false });
+      return;
+    }
 
-    modalEl.querySelectorAll('[data-pc-lib-export]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const profile = state.profiles.find(p => p.id === btn.dataset.pcLibExport);
-        if (!profile) return;
-        const safeName = profile.name.replace(/[\\/:*?"<>|]+/g, '_') || 'protagonist';
-        triggerJsonDownload(`protagonist_${safeName}.json`, serializeProfilesArchive([profile]));
-      });
-    });
+    // Tab 2: 切换目标映射表（只重绘当前这 1 张映射卡片 + 体检区）
+    if (el.dataset.pcTargetSheet !== undefined) {
+      const mIdx = Number(el.dataset.pcTargetSheet);
+      const tblMap = state.mappingPlan?.tableMappings[mIdx];
+      const profile = getSelectedProfile();
+      if (!tblMap || !profile || !state.targetReadResult?.ok) return;
+      const newKey = el.value || null;
+      tblMap.targetSheetKey = newKey;
+      const tgtSchema = state.targetReadResult.sheets.find(s => s.sheetKey === newKey) || null;
+      tblMap.columnMappings = tgtSchema
+        ? buildDefaultColumnMappings(profile.tables[tblMap.sourceIndex], tgtSchema)
+        : {};
+      const inner = getBodyEl()?.querySelector(`[data-pc-map-inner="${mIdx}"]`);
+      if (inner) inner.innerHTML = renderMapCardInnerHtml(profile, state.targetReadResult, tblMap, mIdx);
+      patchPreflightOnly();
+      return;
+    }
 
-    modalEl.querySelectorAll('[data-pc-lib-delete]').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const id = btn.dataset.pcLibDelete;
-        const profile = state.profiles.find(p => p.id === id);
-        if (!profile) return;
-        if (!globalThis.confirm(`确定要从传承库删除主角「${profile.name}」吗？（不会影响已写入任何聊天的记录）`)) {
-          return;
-        }
-        state.profiles = await deleteProfile(getContext(), id);
-        if (state.selectedProfileId === id) {
-          state.selectedProfileId = state.profiles[0]?.id || '';
-        }
-        notifyToast('info', `已删除主角「${profile.name}」。`);
-        renderModal();
-      });
-    });
+    // Tab 2: 单行策略 / 冲突策略（只刷新体检区）
+    if (el.dataset.pcSingleStrategy !== undefined) {
+      const mIdx = Number(el.dataset.pcSingleStrategy);
+      if (state.mappingPlan?.tableMappings[mIdx]) {
+        state.mappingPlan.tableMappings[mIdx].singleRowStrategy = el.value;
+        patchPreflightOnly();
+      }
+      return;
+    }
+
+    if (el.dataset.pcDupStrategy !== undefined) {
+      const mIdx = Number(el.dataset.pcDupStrategy);
+      if (state.mappingPlan?.tableMappings[mIdx]) {
+        state.mappingPlan.tableMappings[mIdx].duplicateStrategy = el.value;
+        patchPreflightOnly();
+      }
+      return;
+    }
+
+    // Tab 2: 切换列写入方式（只替换该列单元格 + 体检区）
+    if (el.dataset.pcColMode !== undefined) {
+      const [mIdx, cIdx] = el.dataset.pcColMode.split(':').map(Number);
+      const tblMap = state.mappingPlan?.tableMappings[mIdx];
+      const profile = getSelectedProfile();
+      const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === tblMap?.targetSheetKey);
+      const tCol = tgtSchema?.columns[cIdx];
+      if (!tblMap || !profile || !tCol) return;
+      const prev = tblMap.columnMappings[tCol.header] || {};
+      const nextCm = {
+        mode: el.value,
+        sourceColumn: prev.sourceColumn || '',
+        extractPart: null,
+        combineColumns: Array.isArray(prev.combineColumns) ? prev.combineColumns : [],
+        joiner: prev.joiner ?? '/',
+        constantValue: prev.constantValue ?? '',
+      };
+      tblMap.columnMappings[tCol.header] = nextCm;
+      const valCell = getBodyEl()?.querySelector(`[data-pc-col-val-cell="${mIdx}:${cIdx}"]`);
+      if (valCell) {
+        valCell.innerHTML = renderColumnValueControlHtml(profile.tables[tblMap.sourceIndex], tgtSchema, tCol, nextCm, mIdx, cIdx);
+      }
+      patchPreflightOnly();
+      return;
+    }
+
+    // Tab 2: 选源列 / 选固定枚举 / 勾选合并列 / 改连接符（只刷新体检区）
+    if (el.dataset.pcColSrc !== undefined) {
+      const [mIdx, cIdx] = el.dataset.pcColSrc.split(':').map(Number);
+      const tblMap = state.mappingPlan?.tableMappings[mIdx];
+      const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === tblMap?.targetSheetKey);
+      const colHeader = tgtSchema?.columns[cIdx]?.header;
+      if (!tblMap || !colHeader) return;
+      tblMap.columnMappings[colHeader].sourceColumn = el.value;
+      tblMap.columnMappings[colHeader].extractPart = null;
+      // 如果有自动提取提示标签，原地移除它
+      const valCell = el.closest('td');
+      valCell?.querySelector('.pc-mini-hint')?.remove();
+      patchPreflightOnly();
+      return;
+    }
+
+    if (el.dataset.pcColConst !== undefined) {
+      const [mIdx, cIdx] = el.dataset.pcColConst.split(':').map(Number);
+      const tblMap = state.mappingPlan?.tableMappings[mIdx];
+      const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === tblMap?.targetSheetKey);
+      const colHeader = tgtSchema?.columns[cIdx]?.header;
+      if (!tblMap || !colHeader) return;
+      tblMap.columnMappings[colHeader].constantValue = el.value;
+      patchPreflightOnly();
+      return;
+    }
+
+    if (el.dataset.pcColCombine !== undefined) {
+      const [mIdx, cIdx] = el.dataset.pcColCombine.split(':').map(Number);
+      const tblMap = state.mappingPlan?.tableMappings[mIdx];
+      const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === tblMap?.targetSheetKey);
+      const colHeader = tgtSchema?.columns[cIdx]?.header;
+      if (!tblMap || !colHeader) return;
+      const list = new Set(tblMap.columnMappings[colHeader].combineColumns || []);
+      if (el.checked) list.add(el.value);
+      else list.delete(el.value);
+      tblMap.columnMappings[colHeader].combineColumns = [...list];
+      patchPreflightOnly();
+      return;
+    }
+
+    if (el.dataset.pcColJoiner !== undefined) {
+      const [mIdx, cIdx] = el.dataset.pcColJoiner.split(':').map(Number);
+      const tblMap = state.mappingPlan?.tableMappings[mIdx];
+      const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === tblMap?.targetSheetKey);
+      const colHeader = tgtSchema?.columns[cIdx]?.header;
+      if (!tblMap || !colHeader) return;
+      tblMap.columnMappings[colHeader].joiner = el.value;
+      patchPreflightOnly();
+      return;
+    }
+
+    if (el.hasAttribute('data-pc-toggle-overflow')) {
+      state.alsoInjectOverflow = el.checked;
+      return;
+    }
+
+    if (el.hasAttribute('data-pc-prompt-pos')) {
+      state.promptPosition = el.value;
+      return;
+    }
+
+    if (el.hasAttribute('data-pc-prompt-role')) {
+      state.promptRole = el.value;
+    }
+  }
+
+  function handleBodyInput(evt) {
+    const el = evt.target;
+    if (!el) return;
+
+    if (el.hasAttribute('data-pc-draft-name')) {
+      if (state.exportDraft) state.exportDraft.name = el.value;
+      return;
+    }
+    if (el.hasAttribute('data-pc-draft-source')) {
+      if (state.exportDraft) state.exportDraft.sourceLabel = el.value;
+      return;
+    }
+    if (el.hasAttribute('data-pc-draft-note')) {
+      if (state.exportDraft) state.exportDraft.note = el.value;
+      return;
+    }
+    if (el.dataset.pcCell !== undefined) {
+      const [sIdx, rIdx, cIdx] = el.dataset.pcCell.split(':').map(Number);
+      const sheet = state.exportDraft?.sheets[sIdx];
+      if (!sheet?.rows[rIdx]) return;
+      sheet.rows[rIdx].values[sheet.headers[cIdx]] = el.value;
+      return;
+    }
+    if (el.dataset.pcColConst !== undefined && el.tagName !== 'SELECT') {
+      const [mIdx, cIdx] = el.dataset.pcColConst.split(':').map(Number);
+      const tblMap = state.mappingPlan?.tableMappings[mIdx];
+      const tgtSchema = state.targetReadResult?.sheets.find(s => s.sheetKey === tblMap?.targetSheetKey);
+      const colHeader = tgtSchema?.columns[cIdx]?.header;
+      if (!tblMap || !colHeader) return;
+      tblMap.columnMappings[colHeader].constantValue = el.value;
+      // 仅防抖更新底部体检区，绝不碰当前输入框焦点与滚动条
+      schedulePreflightPatch();
+      return;
+    }
+    if (el.hasAttribute('data-pc-prompt-depth')) {
+      state.promptDepth = Number(el.value || 0);
+      return;
+    }
+    if (el.hasAttribute('data-pc-prompt-text')) {
+      state.promptDraftText = el.value;
+    }
+  }
+
+  function patchInheritStatusMeta() {
+    const metaEl = getBodyEl()?.querySelector('[data-pc-inherit-status-meta]');
+    if (!metaEl || !state.targetReadResult) return;
+    const ctx = getContext();
+    const identity = state.targetReadResult.identity;
+    const binding = getChatBinding(ctx, identity.bindingKey);
+    metaEl.innerHTML = renderInheritStatusMetaHtml(identity, state.targetReadResult, binding);
   }
 
   function applyOverflowBinding(ctx, profile, overflowText) {
@@ -1420,7 +1597,7 @@ export function createWorkbenchController({ getContext }) {
     if (modalEl && state.activeTab === 'inherit') {
       state.lastWriteReceipt = null;
       refreshTargetContextForInherit({ resetMapping: true });
-      renderModal();
+      renderCurrentTab({ resetScroll: true });
     }
   }
 
