@@ -27,6 +27,12 @@ import {
   loadProfiles,
   saveProfiles,
 } from '../src/storage.js';
+import {
+  claimHostInstance,
+  releaseHostInstance,
+  setRuntimeMode,
+} from '../src/host-env.js';
+import { buildTavernHelperScript } from '../scripts/build-tavern-helper-script.mjs';
 
 /** 真实还原 AlbusKen/shujuku 原版默认模板（主角信息表 + 主角技能表 + 背包物品表） */
 function makeClassicAcuTables() {
@@ -561,5 +567,56 @@ test('11. TauriTavern 宿主检测与原生 extension.store 读写优先级及�
   const fallbackLoaded = await loadProfiles(mockCtx);
   assert.equal(fallbackLoaded[0].name, 'TT主角');
 });
+
+test('12. 酒馆助手 TavernHelper.injectPrompts 次级通道与三通道互斥清理', () => {
+  const injectedCalls = [];
+  const uninjectedIds = [];
+  let disposerCalled = false;
+
+  globalThis.TavernHelper = {
+    injectPrompts: (prompts, options) => {
+      injectedCalls.push({ prompts, options });
+      return { uninject: () => { disposerCalled = true; } };
+    },
+    uninjectPrompts: (ids) => {
+      uninjectedIds.push(...ids);
+    },
+  };
+
+  // 宿主无 setExtensionPrompt，但有 TavernHelper.injectPrompts → 自动走通道 2
+  const res = applyChatPromptInjection(
+    {},
+    { enabled: true, text: '<主角传承档案>酒馆助手测试</主角传承档案>', position: 'before_prompt', depth: 2, role: 'system' },
+    'char:Alice::chat1'
+  );
+  assert.equal(res.active, true);
+  assert.equal(res.channel, 'tavern_helper_injectPrompts');
+  assert.equal(injectedCalls.length, 1);
+  assert.equal(injectedCalls[0].prompts[0].position, 'in_chat'); // 严格遵守 inject.d.ts
+  assert.equal(injectedCalls[0].prompts[0].depth, 9999);
+
+  clearPromptInjection({});
+  assert.equal(disposerCalled, true);
+  assert.ok(uninjectedIds.includes(EXTENSION_PROMPT_KEY));
+
+  delete globalThis.TavernHelper;
+});
+
+test('13. 宿主互斥锁与酒馆助手单文件 JSON 打包产物自检', () => {
+  releaseHostInstance();
+  assert.equal(claimHostInstance('extension'), true);
+  assert.equal(claimHostInstance('tavern-helper'), false); // 阻止重复实例
+  releaseHostInstance();
+  assert.equal(claimHostInstance('tavern-helper'), true);
+  releaseHostInstance();
+  setRuntimeMode(null);
+
+  const built = buildTavernHelperScript({ write: false });
+  assert.equal(built.scriptJson.type, 'script');
+  assert.equal(built.scriptJson.enabled, true);
+  assert.equal(built.scriptJson.button.buttons[0].name, '打开主角传承工作台');
+  assert.ok(built.bundleBytes > 10000);
+});
+
 
 

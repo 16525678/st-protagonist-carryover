@@ -5,22 +5,12 @@
  */
 
 import { extractSheetsFromTableData } from './schema-engine.js';
+import { getHostWindow } from './host-env.js';
 
-function getTopWindow() {
-  try {
-    if (typeof window !== 'undefined' && window.parent && window.parent !== window && window.parent.AutoCardUpdaterAPI) {
-      return window.parent;
-    }
-  } catch {
-    // 跨域 iframe 忽略
-  }
-  return typeof window !== 'undefined' ? window : globalThis;
-}
-
-/** 检测龙血玄黄·数据库公开 API 是否已就绪 */
+/** 检测龙血玄黄·数据库公开 API 是否已就绪（兼容扩展主窗口与酒馆助手 iframe） */
 export function detectAcuApi() {
-  const win = getTopWindow();
-  const api = win?.AutoCardUpdaterAPI || null;
+  const hostWin = getHostWindow();
+  const api = hostWin?.AutoCardUpdaterAPI || globalThis.AutoCardUpdaterAPI || null;
   if (!api || typeof api !== 'object') {
     return {
       available: false,

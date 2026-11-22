@@ -4,6 +4,19 @@
 
 ---
 
+## v0.4.0（2026-11-23）
+
+### 完整兼容「酒馆助手（Tavern Helper / JS-Slash-Runner）」
+- **新增一键导入的酒馆助手脚本 JSON**：仓库根目录提供离线自包含脚本 [酒馆助手脚本-主角跨聊天传承.json](./酒馆助手脚本-主角跨聊天传承.json)（内置完整逻辑与样式，零外部 CDN 依赖、离线秒开），支持直接在酒馆助手「脚本库 → 导入」安装；并新增确定性构建脚本 `scripts/build-tavern-helper-script.mjs` 保证扩展与脚本同源一致。
+- **跨 iframe 宿主桥接层（`src/host-env.js`）**：自动识别「酒馆扩展模式」与「酒馆助手 script iframe 模式」，在酒馆助手下自动将工作台弹窗、样式、魔法棒入口与扩展抽屉挂载到宿主顶层窗口 `window.parent.document`，并支持剪贴板/文件下载跨窗口运行。
+- **三通道互斥提示词注入**：新增 **酒馆助手原生 `TavernHelper.injectPrompts / uninjectPrompts`** 作为第二通道（优先级：`ST 原生 setExtensionPrompt` → `TavernHelper.injectPrompts` → `generate_interceptor`），三条通道严格互斥不双倍注入。
+- **酒馆助手快捷按钮 + 防重复加载 + 卸载自动清理**：
+  - 内置酒馆助手脚本按钮「打开主角传承工作台」（`eventOn(getButtonEvent(...))`）；
+  - 新增宿主全局互斥标记（`__ST_PROTAGONIST_CARRYOVER_LOADED__`），误同时启用酒馆扩展和酒馆助手脚本时自动跳过重复实例；
+  - 在酒馆助手关闭/重载脚本销毁 iframe 时自动清理弹窗、样式、按钮、监听器与注入状态。
+
+---
+
 ## v0.3.0（2026-11-23）
 
 ### 桌面端 + 手机端（TauriTavern / SillyTavern）双端适配与手机防卡重构

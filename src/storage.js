@@ -1,9 +1,9 @@
 /**
  * src/storage.js
- * 主角传承库与聊天级绑定状态的持久化管理（同时适配 TauriTavern 与 SillyTavern）。
+ * 主角传承库与聊天级绑定状态的持久化管理（同时适配 TauriTavern、SillyTavern 与酒馆助手脚本模式）。
  *
  * 存储优先级（自动降级）：
- * 1. TauriTavern 原生持久化：window.__TAURITAVERN__.api.extension.store (setJson / tryGetJson)
+ * 1. TauriTavern 原生持久化：hostWindow.__TAURITAVERN__.api.extension.store (setJson / tryGetJson)
  * 2. SillyTavern 内置大容量库：SillyTavern.libs.localforage (IndexedDB)
  * 3. SillyTavern 通用扩展设置：SillyTavern.getContext().extensionSettings + saveSettingsDebounced
  */
@@ -14,6 +14,13 @@ import {
   assertSafeJsonObject,
   deepCloneSafe,
 } from './schema-engine.js';
+import {
+  detectRuntimeMode,
+  getHostDocument,
+  getHostWindow,
+  getSillyTavernGlobal,
+  getTavernHelperApi,
+} from './host-env.js';
 
 export const MODULE_NAME = 'st_protagonist_carryover';
 const TT_STORE_NAMESPACE = 'st-protagonist-carryover';
@@ -29,21 +36,10 @@ const DEFAULT_SETTINGS = Object.freeze({
   defaultPromptRole: 'system',
 });
 
-function getTopWindowSafe() {
-  try {
-    if (typeof window !== 'undefined' && window.parent && window.parent !== window && window.parent.__TAURITAVERN__) {
-      return window.parent;
-    }
-  } catch {
-    // 跨域 iframe 忽略
-  }
-  return typeof window !== 'undefined' ? window : globalThis;
-}
-
 /** 检测当前宿主是否为 TauriTavern（Rust + 系统 WebView） */
 export function isTauriTavernHost() {
   try {
-    const win = getTopWindowSafe();
+    const win = getHostWindow();
     return Boolean(globalThis.__TAURITAVERN__ || win?.__TAURITAVERN__);
   } catch {
     return false;
@@ -52,8 +48,8 @@ export function isTauriTavernHost() {
 
 function getTauriTavernStore() {
   try {
-    const win = getTopWindowSafe();
-    const tt = globalThis.__TAURITAVERN__ || win?.__TAURITAVERN__;
+    const win = getHostWindow();
+    const tt = win?.__TAURITAVERN__ || globalThis.__TAURITAVERN__;
     const store = tt?.api?.extension?.store;
     if (store && typeof store.setJson === 'function' && typeof store.tryGetJson === 'function') {
       return store;
@@ -66,7 +62,7 @@ function getTauriTavernStore() {
 
 function getLocalForage() {
   try {
-    const lf = globalThis?.SillyTavern?.libs?.localforage;
+    const lf = getSillyTavernGlobal()?.libs?.localforage;
     if (lf && typeof lf.getItem === 'function' && typeof lf.setItem === 'function') {
       return lf;
     }
@@ -78,11 +74,12 @@ function getLocalForage() {
 
 export function isMobileViewport() {
   try {
-    if (typeof window === 'undefined') return false;
-    if (typeof window.matchMedia === 'function') {
-      if (window.matchMedia('(max-width: 768px)').matches) return true;
+    const win = getHostWindow();
+    if (!win) return false;
+    if (typeof win.matchMedia === 'function') {
+      if (win.matchMedia('(max-width: 768px)').matches) return true;
     }
-    return Number(window.innerWidth || 0) > 0 && Number(window.innerWidth) <= 768;
+    return Number(win.innerWidth || 0) > 0 && Number(win.innerWidth) <= 768;
   } catch {
     return false;
   }
@@ -91,12 +88,18 @@ export function isMobileViewport() {
 export function getHostRuntimeSummary() {
   const isTT = isTauriTavernHost();
   const isMobile = isMobileViewport();
+  const runtimeMode = detectRuntimeMode();
+  const hasTavernHelper = Boolean(getTavernHelperApi());
   const hasTtStore = Boolean(getTauriTavernStore());
   const hasLf = Boolean(getLocalForage());
+  const modeBadge = runtimeMode === 'tavern-helper' ? '酒馆助手脚本' : '酒馆扩展';
+
   return {
     isTauriTavern: isTT,
     isMobile,
-    hostLabel: `${isTT ? 'TauriTavern' : 'SillyTavern'} · ${isMobile ? '手机端' : '桌面端'}`,
+    runtimeMode,
+    hasTavernHelper,
+    hostLabel: `${isTT ? 'TauriTavern' : 'SillyTavern'} · ${isMobile ? '手机端' : '桌面端'} · ${modeBadge}`,
     storageLabel: hasTtStore
       ? 'TT原生存储'
       : hasLf
@@ -134,7 +137,7 @@ function saveSettings(context) {
   }
 }
 
-/** 读取所有已保存的主角传承档案（按 TT store -> localforage -> extensionSettings 顺序，并自动向下兼容迁移） */
+/** 读取所有已保存的主角传承档案 */
 export async function loadProfiles(context) {
   const ttStore = getTauriTavernStore();
   if (ttStore) {
@@ -156,7 +159,6 @@ export async function loadProfiles(context) {
     try {
       const saved = await lf.getItem(LOCALFORAGE_PROFILES_KEY);
       if (Array.isArray(saved) && saved.length > 0) {
-        // 如果是在 TT 里升级后首次读取旧 IndexedDB 数据，自动同步一份到 TT 原生 store
         if (ttStore) {
           ttStore.setJson({
             namespace: TT_STORE_NAMESPACE,
@@ -200,7 +202,6 @@ export async function saveProfiles(context, profiles) {
         key: TT_STORE_PROFILES_KEY,
         value: clean,
       });
-      // 同时异步双写一份到 localforage（如果可用）作为本地缓存保底，不阻塞主流程
       const lf = getLocalForage();
       if (lf) lf.setItem(LOCALFORAGE_PROFILES_KEY, clean).catch(() => {});
       return { backend: 'tauritavern-store' };
@@ -283,42 +284,51 @@ export function serializeProfilesArchive(profiles) {
   return JSON.stringify(payload, null, 2);
 }
 
-/** 在浏览器/Tauri WebView 中触发 JSON 文件下载 */
+/** 在宿主窗口/Tauri WebView 中触发 JSON 文件下载（兼容酒馆助手 iframe） */
 export function triggerJsonDownload(filename, jsonString) {
-  const blob = new Blob([jsonString], { type: 'application/json;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
+  const doc = getHostDocument();
+  const win = getHostWindow();
+  if (!doc || !win) return;
+  const BlobCtor = win.Blob || globalThis.Blob;
+  const UrlApi = win.URL || globalThis.URL;
+  const blob = new BlobCtor([jsonString], { type: 'application/json;charset=utf-8' });
+  const url = UrlApi.createObjectURL(blob);
+  const link = doc.createElement('a');
   link.href = url;
   link.download = filename;
-  document.body.appendChild(link);
+  doc.body.appendChild(link);
   link.click();
-  document.body.removeChild(link);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  doc.body.removeChild(link);
+  setTimeout(() => UrlApi.revokeObjectURL(url), 1000);
 }
 
-/** 手机端 WebView 友好的剪贴板复制（优先 navigator.clipboard，失败降级 textarea 选中复制） */
+/** 手机端 WebView & 酒馆助手 iframe 友好的剪贴板复制 */
 export async function copyTextToClipboard(text) {
   const str = String(text ?? '');
+  const win = getHostWindow();
+  const doc = getHostDocument();
   try {
-    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(str);
+    const nav = win?.navigator || globalThis.navigator;
+    if (nav?.clipboard?.writeText) {
+      await nav.clipboard.writeText(str);
       return true;
     }
   } catch {
-    // 降级到传统选区复制（部分 Android/iOS WebView 限制 clipboard API）
+    // 降级到传统选区复制
   }
   try {
-    const ta = document.createElement('textarea');
+    if (!doc?.body) return false;
+    const ta = doc.createElement('textarea');
     ta.value = str;
     ta.setAttribute('readonly', '');
     ta.style.position = 'fixed';
     ta.style.left = '-9999px';
     ta.style.top = '0';
-    document.body.appendChild(ta);
+    doc.body.appendChild(ta);
     ta.select();
     ta.setSelectionRange(0, str.length);
-    const ok = document.execCommand('copy');
-    document.body.removeChild(ta);
+    const ok = doc.execCommand('copy');
+    doc.body.removeChild(ta);
     return Boolean(ok);
   } catch {
     return false;

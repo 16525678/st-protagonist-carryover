@@ -17,7 +17,14 @@
       "owner": "sillytavern",
       "symbol": "SillyTavern.getContext().setExtensionPrompt",
       "required": false,
-      "fallback": "Falls back to manifest generate_interceptor (ProtagonistCarryover_interceptGeneration) without double injection."
+      "fallback": "Falls back to TavernHelper.injectPrompts (if present) or manifest generate_interceptor without double injection."
+    },
+    {
+      "id": "tavern-helper-inject-prompts",
+      "owner": "tavern-helper",
+      "symbol": "TavernHelper.injectPrompts",
+      "required": false,
+      "fallback": "Uses SillyTavern.getContext().setExtensionPrompt or manifest generate_interceptor."
     },
     {
       "id": "tt-extension-store",

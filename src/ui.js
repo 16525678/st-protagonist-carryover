@@ -32,7 +32,13 @@ import {
   applyChatPromptInjection,
   clearPromptInjection,
   getActiveInjectionStatus,
+  getChannelDisplayName,
 } from './prompt-injector.js';
+import {
+  getHostDocument,
+  getHostToastr,
+  getHostWindow,
+} from './host-env.js';
 import {
   copyTextToClipboard,
   deleteProfile,
@@ -80,8 +86,9 @@ function formatTime(ts) {
 
 function notifyToast(type, message) {
   try {
-    if (typeof globalThis.toastr?.[type] === 'function') {
-      globalThis.toastr[type](message, '主角跨聊天传承');
+    const toastrApi = getHostToastr();
+    if (typeof toastrApi?.[type] === 'function') {
+      toastrApi[type](message, '主角跨聊天传承');
       return;
     }
   } catch {
@@ -123,8 +130,9 @@ export function createWorkbenchController({ getContext }) {
 
   function setBackgroundScrollLock(locked) {
     try {
-      document.documentElement?.classList.toggle(LOCK_SCROLL_CLASS, locked);
-      document.body?.classList.toggle(LOCK_SCROLL_CLASS, locked);
+      const doc = getHostDocument();
+      doc?.documentElement?.classList.toggle(LOCK_SCROLL_CLASS, locked);
+      doc?.body?.classList.toggle(LOCK_SCROLL_CLASS, locked);
     } catch {
       // ignore
     }
@@ -256,7 +264,8 @@ export function createWorkbenchController({ getContext }) {
 
   /** 刷新设置面板抽屉内的状态摘要（极轻量探针，零解析开销） */
   function updateSettingsDrawerStatus() {
-    const drawer = document.getElementById(DRAWER_ID);
+    const doc = getHostDocument();
+    const drawer = doc?.getElementById(DRAWER_ID);
     if (!drawer) return;
     const ctx = getContext();
     const identity = getCurrentChatIdentity(ctx);
@@ -274,7 +283,7 @@ export function createWorkbenchController({ getContext }) {
       : '当前聊天未检测到龙血玄黄数据库（可用导入 / 提示词注入）';
 
     const bindText = binding?.enabled
-      ? `当前聊天已开启注入：<strong>${escapeHtml(binding.profileName || '未命名主角')}</strong>（${injStatus.channel === 'native_setExtensionPrompt' ? '原生通道' : '拦截器兜底'}）`
+      ? `当前聊天已开启注入：<strong>${escapeHtml(binding.profileName || '未命名主角')}</strong>（${escapeHtml(getChannelDisplayName(injStatus.channel))}）`
       : '当前聊天未绑定主角提示词注入';
 
     statusEl.innerHTML = `
@@ -288,13 +297,15 @@ export function createWorkbenchController({ getContext }) {
     }
   }
 
-  /** 在聊天输入框旁的魔法棒菜单（#extensionsMenu）注入一键入口，手机端 1 点即开 */
+  /** 在聊天输入框旁的魔法棒菜单（#extensionsMenu）注入一键入口，手机端与酒馆助手模式均 1 点即开 */
   function mountWandMenuButton() {
-    if (document.getElementById(WAND_ITEM_ID)) return;
-    const menu = document.getElementById('extensionsMenu');
+    const doc = getHostDocument();
+    const win = getHostWindow();
+    if (!doc || doc.getElementById(WAND_ITEM_ID)) return;
+    const menu = doc.getElementById('extensionsMenu');
     if (!menu) return;
 
-    const item = document.createElement('div');
+    const item = doc.createElement('div');
     item.id = WAND_ITEM_ID;
     item.className = 'list-group-item flex-container flexGap5 interactable';
     item.setAttribute('tabindex', '0');
@@ -303,9 +314,10 @@ export function createWorkbenchController({ getContext }) {
       <span>主角跨聊天传承</span>
     `;
     item.addEventListener('click', () => {
-      const wandBtn = document.getElementById('extensionsMenuButton');
-      const wandMenu = document.getElementById('extensionsMenu');
-      if (wandBtn && wandMenu && getComputedStyle(wandMenu).display !== 'none') {
+      const wandBtn = doc.getElementById('extensionsMenuButton');
+      const wandMenu = doc.getElementById('extensionsMenu');
+      const styleFn = win?.getComputedStyle || globalThis.getComputedStyle;
+      if (wandBtn && wandMenu && typeof styleFn === 'function' && styleFn(wandMenu).display !== 'none') {
         wandBtn.click();
       }
       openWorkbench();
@@ -316,16 +328,18 @@ export function createWorkbenchController({ getContext }) {
   function mountSettingsDrawer() {
     mountWandMenuButton();
 
-    if (document.getElementById(DRAWER_ID)) {
+    const doc = getHostDocument();
+    if (!doc) return;
+    if (doc.getElementById(DRAWER_ID)) {
       updateSettingsDrawerStatus();
       return;
     }
     const container =
-      document.getElementById('extensions_settings2') ||
-      document.getElementById('extensions_settings');
+      doc.getElementById('extensions_settings2') ||
+      doc.getElementById('extensions_settings');
     if (!container) return;
 
-    const wrapper = document.createElement('div');
+    const wrapper = doc.createElement('div');
     wrapper.id = DRAWER_ID;
     wrapper.className = 'pc-extension-settings';
     wrapper.innerHTML = `
@@ -362,8 +376,9 @@ export function createWorkbenchController({ getContext }) {
   }
 
   function unmountSettingsDrawer() {
-    document.getElementById(DRAWER_ID)?.remove();
-    document.getElementById(WAND_ITEM_ID)?.remove();
+    const doc = getHostDocument();
+    doc?.getElementById(DRAWER_ID)?.remove();
+    doc?.getElementById(WAND_ITEM_ID)?.remove();
   }
 
   async function openWorkbench(initialTab) {
@@ -382,8 +397,9 @@ export function createWorkbenchController({ getContext }) {
       clearTimeout(preflightDebounceTimer);
       preflightDebounceTimer = null;
     }
-    if (resizeHandler && typeof window !== 'undefined') {
-      window.removeEventListener('resize', resizeHandler);
+    const win = getHostWindow();
+    if (resizeHandler && win?.removeEventListener) {
+      win.removeEventListener('resize', resizeHandler);
       resizeHandler = null;
     }
     setBackgroundScrollLock(false);
@@ -395,12 +411,15 @@ export function createWorkbenchController({ getContext }) {
   }
 
   function ensureModalElement() {
-    if (modalEl && document.body.contains(modalEl)) return modalEl;
-    document.getElementById(MODAL_ID)?.remove();
+    const doc = getHostDocument();
+    const win = getHostWindow();
+    if (!doc?.body) return null;
+    if (modalEl && doc.body.contains(modalEl)) return modalEl;
+    doc.getElementById(MODAL_ID)?.remove();
     const runtime = getHostRuntimeSummary();
     lastRenderedMobile = runtime.isMobile;
 
-    modalEl = document.createElement('div');
+    modalEl = doc.createElement('div');
     modalEl.id = MODAL_ID;
     modalEl.className = 'pc-overlay';
     modalEl.innerHTML = `
@@ -438,7 +457,7 @@ export function createWorkbenchController({ getContext }) {
     bodyEl.addEventListener('input', handleBodyInput);
 
     // 旋转屏幕或跨桌面/手机断点缩放时无缝切换布局（不丢草稿状态）
-    if (typeof window !== 'undefined') {
+    if (win?.addEventListener) {
       resizeHandler = () => {
         const nowMobile = isMobileViewport();
         if (nowMobile !== lastRenderedMobile && modalEl) {
@@ -449,10 +468,10 @@ export function createWorkbenchController({ getContext }) {
           renderCurrentTab({ resetScroll: false });
         }
       };
-      window.addEventListener('resize', resizeHandler, { passive: true });
+      win.addEventListener('resize', resizeHandler, { passive: true });
     }
 
-    document.body.appendChild(modalEl);
+    doc.body.appendChild(modalEl);
     setBackgroundScrollLock(true);
     return modalEl;
   }
@@ -782,7 +801,9 @@ export function createWorkbenchController({ getContext }) {
     const html = isMobileViewport()
       ? renderMobileRowCardHtml(s, sIdx, r, rIdx)
       : renderDesktopRowHtml(s, sIdx, r, rIdx);
-    const tpl = document.createElement('template');
+    const doc = getHostDocument();
+    if (!doc) return;
+    const tpl = doc.createElement('template');
     tpl.innerHTML = html.trim();
     const nextEl = tpl.content.firstElementChild;
     if (nextEl) {
@@ -1497,7 +1518,7 @@ export function createWorkbenchController({ getContext }) {
       setChatBinding(ctx, identity.bindingKey, binding);
       const res = applyChatPromptInjection(ctx, binding, identity.bindingKey);
       updateSettingsDrawerStatus();
-      notifyToast('success', `已将主角「${binding.profileName}」注入当前聊天（${res.channel === 'native_setExtensionPrompt' ? '原生通道' : '拦截器兜底'}）。`);
+      notifyToast('success', `已将主角「${binding.profileName}」注入当前聊天（${getChannelDisplayName(res.channel)}）。`);
       patchInheritStatusMeta();
       const host = getBodyEl()?.querySelector('[data-pc-inherit-mode-host]');
       if (host) host.innerHTML = renderPromptInjectSection(profile, identity, binding);
@@ -1567,7 +1588,8 @@ export function createWorkbenchController({ getContext }) {
       const id = target.dataset.pcLibDelete;
       const profile = state.profiles.find(p => p.id === id);
       if (!profile) return;
-      if (!globalThis.confirm(`确定要从传承库删除主角「${profile.name}」吗？（不会影响已写入任何聊天的记录）`)) {
+      const confirmFn = getHostWindow()?.confirm || globalThis.confirm;
+      if (typeof confirmFn === 'function' && !confirmFn(`确定要从传承库删除主角「${profile.name}」吗？（不会影响已写入任何聊天的记录）`)) {
         return;
       }
       state.profiles = await deleteProfile(getContext(), id);
