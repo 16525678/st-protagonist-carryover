@@ -1,6 +1,8 @@
 # 主角跨聊天传承（适配龙血玄黄·数据库）
 
-这是一个面向 **SillyTavern（酒馆）** 的纯前端扩展插件，专门搭配 **[AlbusKen/shujuku](https://github.com/AlbusKen/shujuku)（龙血玄黄·数据库）** 使用，让你把旧聊天里养出来的主角带进另一个新聊天（同卡二周目或全新世界观角色卡），不用整库覆盖、也不花任何额外 AI API 费用。
+这是一个面向 **SillyTavern（酒馆）** 与 **TauriTavern** 的纯前端扩展插件，专门搭配 **[AlbusKen/shujuku](https://github.com/AlbusKen/shujuku)（龙血玄黄·数据库）** 使用，让你把旧聊天里养出来的主角带进另一个新聊天（同卡二周目或全新世界观角色卡），不用整库覆盖、也不花任何额外 AI API 费用。
+
+> 📋 版本更新记录请查看 [CHANGELOG.md](./CHANGELOG.md)。
 
 ---
 
