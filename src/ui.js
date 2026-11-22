@@ -295,7 +295,7 @@ export function createWorkbenchController({ getContext }) {
       refreshTargetContextForInherit({ resetMapping: true });
     }
     ensureModalElement();
-    renderModal();
+    renderModal({ resetScroll: true });
   }
 
   function closeWorkbench() {
@@ -312,22 +312,6 @@ export function createWorkbenchController({ getContext }) {
     modalEl = document.createElement('div');
     modalEl.id = MODAL_ID;
     modalEl.className = 'pc-overlay';
-    modalEl.addEventListener('click', (evt) => {
-      if (evt.target === modalEl) closeWorkbench();
-    });
-    document.body.appendChild(modalEl);
-    return modalEl;
-  }
-
-  function renderModal() {
-    if (!modalEl) return;
-    const tabHtml =
-      state.activeTab === 'export'
-        ? renderExportTab()
-        : state.activeTab === 'inherit'
-          ? renderInheritTab()
-          : renderLibraryTab();
-
     modalEl.innerHTML = `
       <div class="pc-modal" role="dialog" aria-modal="true" aria-label="主角跨聊天传承工作台">
         <div class="pc-header">
@@ -338,23 +322,94 @@ export function createWorkbenchController({ getContext }) {
           <button type="button" class="pc-close-btn" data-pc-close title="关闭">✕</button>
         </div>
         <div class="pc-tabs">
-          <button type="button" class="pc-tab ${state.activeTab === 'export' ? 'is-active' : ''}" data-pc-tab="export">
-            1. 导出主角
-          </button>
-          <button type="button" class="pc-tab ${state.activeTab === 'inherit' ? 'is-active' : ''}" data-pc-tab="inherit">
-            2. 继承到当前聊天
-          </button>
-          <button type="button" class="pc-tab ${state.activeTab === 'library' ? 'is-active' : ''}" data-pc-tab="library">
-            3. 主角传承库 (${state.profiles.length})
-          </button>
+          <button type="button" class="pc-tab" data-pc-tab="export">1. 导出主角</button>
+          <button type="button" class="pc-tab" data-pc-tab="inherit">2. 继承到当前聊天</button>
+          <button type="button" class="pc-tab" data-pc-tab="library">3. 主角传承库 (0)</button>
         </div>
-        <div class="pc-body">
-          ${tabHtml}
-        </div>
+        <div class="pc-body"></div>
       </div>
     `;
+    modalEl.addEventListener('click', (evt) => {
+      if (evt.target === modalEl) closeWorkbench();
+    });
+    modalEl.querySelector('[data-pc-close]')?.addEventListener('click', closeWorkbench);
+    modalEl.querySelectorAll('.pc-tabs [data-pc-tab]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        state.activeTab = btn.dataset.pcTab;
+        state.lastWriteReceipt = null;
+        if (state.activeTab === 'inherit') {
+          refreshTargetContextForInherit({ resetMapping: true });
+        }
+        renderModal({ resetScroll: true });
+      });
+    });
+    document.body.appendChild(modalEl);
+    return modalEl;
+  }
 
-    bindModalEvents();
+  function renderModal({ resetScroll = false } = {}) {
+    if (!modalEl) return;
+    const bodyEl = modalEl.querySelector('.pc-body');
+    if (!bodyEl) return;
+
+    // 重绘前记录当前纵向滚动位置、内部表格横向/纵向滚动位置以及展开的规则说明
+    const savedBodyScrollTop = resetScroll ? 0 : bodyEl.scrollTop;
+    const savedInnerScrolls = new Map();
+    const savedOpenDetails = new Set();
+    if (!resetScroll) {
+      bodyEl.querySelectorAll('[data-pc-scroll-key]').forEach(el => {
+        savedInnerScrolls.set(el.dataset.pcScrollKey, {
+          top: el.scrollTop,
+          left: el.scrollLeft,
+        });
+      });
+      bodyEl.querySelectorAll('details[data-pc-details-key]').forEach(el => {
+        if (el.open) savedOpenDetails.add(el.dataset.pcDetailsKey);
+      });
+    }
+
+    // 只更新标签高亮与计数，不销毁弹窗外框与 .pc-body 节点
+    modalEl.querySelectorAll('.pc-tabs [data-pc-tab]').forEach(btn => {
+      btn.classList.toggle('is-active', btn.dataset.pcTab === state.activeTab);
+      if (btn.dataset.pcTab === 'library') {
+        btn.textContent = `3. 主角传承库 (${state.profiles.length})`;
+      }
+    });
+
+    const tabHtml =
+      state.activeTab === 'export'
+        ? renderExportTab()
+        : state.activeTab === 'inherit'
+          ? renderInheritTab()
+          : renderLibraryTab();
+
+    bodyEl.innerHTML = tabHtml;
+    bindBodyEvents(bodyEl);
+
+    // 先恢复 <details> 展开状态再恢复滚动位置，防止高度变化导致偏移
+    if (!resetScroll) {
+      savedOpenDetails.forEach(key => {
+        const el = bodyEl.querySelector(`details[data-pc-details-key="${key}"]`);
+        if (el) el.open = true;
+      });
+    }
+
+    const restoreScroll = () => {
+      bodyEl.scrollTop = savedBodyScrollTop;
+      if (!resetScroll) {
+        savedInnerScrolls.forEach((pos, key) => {
+          const el = bodyEl.querySelector(`[data-pc-scroll-key="${key}"]`);
+          if (el) {
+            el.scrollTop = pos.top;
+            el.scrollLeft = pos.left;
+          }
+        });
+      }
+    };
+    restoreScroll();
+    if (typeof globalThis.requestAnimationFrame === 'function') {
+      globalThis.requestAnimationFrame(restoreScroll);
+    }
   }
 
   /* ===================== Tab 1: 导出主角 ===================== */
@@ -398,7 +453,7 @@ export function createWorkbenchController({ getContext }) {
         const rowsHtml = s.expanded
           ? s.rows.length === 0
             ? `<div class="pc-muted pc-pad-sm">这张表目前是空的（暂无数据行）。</div>`
-            : `<div class="pc-table-scroll">
+            : `<div class="pc-table-scroll" data-pc-scroll-key="export-sheet-${sIdx}">
                 <table class="pc-data-table">
                   <thead>
                     <tr>
@@ -666,8 +721,8 @@ export function createWorkbenchController({ getContext }) {
               <div class="pc-badges">${ruleBadges}</div>
               ${strategyControl}
             </div>
-            ${tgtSchema.noteSummary ? `<details class="pc-note-details"><summary>查看目标表原规则说明：${escapeHtml(tgtSchema.noteSummary)}</summary><pre class="pc-note-pre">${escapeHtml(tgtSchema.note)}</pre></details>` : ''}
-            <div class="pc-table-scroll">
+            ${tgtSchema.noteSummary ? `<details class="pc-note-details" data-pc-details-key="map-note-${mIdx}"><summary>查看目标表原规则说明：${escapeHtml(tgtSchema.noteSummary)}</summary><pre class="pc-note-pre">${escapeHtml(tgtSchema.note)}</pre></details>` : ''}
+            <div class="pc-table-scroll" data-pc-scroll-key="map-sheet-${mIdx}">
               <table class="pc-map-table">
                 <thead>
                   <tr>
@@ -767,7 +822,7 @@ export function createWorkbenchController({ getContext }) {
           <span class="${compiled.summary.warnings > 0 ? 'pc-warn' : 'pc-muted'}">提示 ${compiled.summary.warnings} 条</span> ·
           <span class="${compiled.summary.errors > 0 ? 'pc-err' : 'pc-ok'}">错误 ${compiled.summary.errors} 条</span>
         </div>
-        <div class="pc-op-list">${opPreviewRows || '<div class="pc-muted">当前没有计划写入数据库的行（全部已转入下方补充提示词）。</div>'}</div>
+        <div class="pc-op-list" data-pc-scroll-key="op-list">${opPreviewRows || '<div class="pc-muted">当前没有计划写入数据库的行（全部已转入下方补充提示词）。</div>'}</div>
       </div>
       ${overflowBox}
       ${receiptBox}
@@ -884,25 +939,23 @@ export function createWorkbenchController({ getContext }) {
     return `${topBar}${cards}`;
   }
 
-  /* ===================== 事件绑定 ===================== */
-  function bindModalEvents() {
-    if (!modalEl) return;
+  /* ===================== 事件绑定（仅绑定 .pc-body 内动态节点） ===================== */
+  function bindBodyEvents(bodyEl) {
+    if (!bodyEl) return;
 
-    modalEl.querySelector('[data-pc-close]')?.addEventListener('click', closeWorkbench);
-
-    modalEl.querySelectorAll('[data-pc-tab]').forEach(btn => {
+    bodyEl.querySelectorAll('[data-pc-tab]').forEach(btn => {
       btn.addEventListener('click', () => {
         state.activeTab = btn.dataset.pcTab;
         state.lastWriteReceipt = null;
         if (state.activeTab === 'inherit') {
           refreshTargetContextForInherit({ resetMapping: true });
         }
-        renderModal();
+        renderModal({ resetScroll: true });
       });
     });
 
     // Tab 1 events
-    modalEl.querySelector('[data-pc-read-current]')?.addEventListener('click', () => {
+    bodyEl.querySelector('[data-pc-read-current]')?.addEventListener('click', () => {
       const readRes = readCurrentChatAcuTables(getContext());
       if (!readRes.ok) {
         notifyToast('warning', readRes.reason);
@@ -1023,7 +1076,7 @@ export function createWorkbenchController({ getContext }) {
       state.lastWriteReceipt = null;
       refreshTargetContextForInherit({ resetMapping: true });
       notifyToast('success', `主角「${saved.profile.name}」已保存到传承库！现在可以切到新聊天继承了。`);
-      renderModal();
+      renderModal({ resetScroll: true });
     });
 
     // Tab 2 events
@@ -1298,7 +1351,7 @@ export function createWorkbenchController({ getContext }) {
         state.activeTab = 'inherit';
         state.lastWriteReceipt = null;
         refreshTargetContextForInherit({ resetMapping: true });
-        renderModal();
+        renderModal({ resetScroll: true });
       });
     });
 
@@ -1308,7 +1361,7 @@ export function createWorkbenchController({ getContext }) {
         if (!profile) return;
         state.exportDraft = buildExportDraftFromProfile(profile);
         state.activeTab = 'export';
-        renderModal();
+        renderModal({ resetScroll: true });
       });
     });
 

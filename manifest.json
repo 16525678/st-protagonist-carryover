@@ -4,7 +4,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "16525678",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "homePage": "https://github.com/16525678/st-protagonist-carryover",
   "auto_update": false,
   "generate_interceptor": "ProtagonistCarryover_interceptGeneration"
