@@ -1,0 +1,11 @@
+{
+  "display_name": "主角跨聊天传承（适配龙血玄黄数据库）",
+  "loading_order": 220,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "16525678",
+  "version": "0.1.0",
+  "homePage": "https://github.com/16525678/st-protagonist-carryover",
+  "auto_update": false,
+  "generate_interceptor": "ProtagonistCarryover_interceptGeneration"
+}

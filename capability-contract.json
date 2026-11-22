@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "minimum": {
+    "sillytavern": "1.14.0",
+    "tavernHelper": null
+  },
+  "requirements": [
+    {
+      "id": "st-context",
+      "owner": "sillytavern",
+      "symbol": "SillyTavern.getContext",
+      "required": true,
+      "fallback": null
+    },
+    {
+      "id": "st-set-extension-prompt",
+      "owner": "sillytavern",
+      "symbol": "SillyTavern.getContext().setExtensionPrompt",
+      "required": false,
+      "fallback": "Falls back to manifest generate_interceptor (ProtagonistCarryover_interceptGeneration) without double injection."
+    },
+    {
+      "id": "st-localforage",
+      "owner": "sillytavern",
+      "symbol": "SillyTavern.libs.localforage",
+      "required": false,
+      "fallback": "Falls back to SillyTavern extensionSettings with saveSettingsDebounced."
+    },
+    {
+      "id": "acu-database-api",
+      "owner": "provider",
+      "symbol": "window.AutoCardUpdaterAPI",
+      "required": false,
+      "fallback": "Supports offline TavernDB_checkpoint JSON upload for export and chat-scoped prompt injection for chats without the database plugin."
+    }
+  ]
+}
