@@ -12,7 +12,17 @@ import {
   parseImportedSourceJson,
   parseSheetSchema,
 } from '../src/schema-engine.js';
-import { executeCompiledWritePlan } from '../src/acu-adapter.js';
+import {
+  collectAcuDiagnostics,
+  detectAcuApi,
+  executeCompiledWritePlan,
+  extractAcuTableDataFromChatFloors,
+  formatAcuDiagnosticsText,
+  normalizeAcuTablePayload,
+  probeAcuStatusLight,
+  readCurrentChatAcuTables,
+  readCurrentChatAcuTablesAsync,
+} from '../src/acu-adapter.js';
 import {
   EXTENSION_PROMPT_KEY,
   INTERCEPTOR_GLOBAL_NAME,
@@ -29,6 +39,7 @@ import {
 } from '../src/storage.js';
 import {
   claimHostInstance,
+  getSillyTavernContextSafe,
   releaseHostInstance,
   setRuntimeMode,
 } from '../src/host-env.js';
@@ -616,6 +627,211 @@ test('13. 宿主互斥锁与酒馆助手单文件 JSON 打包产物自检', () =
   assert.equal(built.scriptJson.enabled, true);
   assert.equal(built.scriptJson.button.buttons[0].name, '打开主角传承工作台');
   assert.ok(built.bundleBytes > 10000);
+});
+
+test('14. 多窗口穿透扫描（嵌套 top / 同源子 frame / 跨域 SecurityError 不崩溃）与扁平 SillyTavern 兼容', () => {
+  // 场景 A：嵌套 iframe，AutoCardUpdaterAPI 挂在 window.top，iframe 内 SillyTavern 是扁平对象
+  const topWin = {
+    document: {},
+    AutoCardUpdaterAPI: {
+      exportTableAsJson: () => makeClassicAcuTables(),
+      updateRow: async () => true,
+      insertRow: async () => 1,
+    },
+  };
+  topWin.parent = topWin;
+  topWin.top = topWin;
+  const midWin = { document: {}, parent: topWin, top: topWin };
+  const innerWin = {
+    document: {},
+    parent: midWin,
+    top: topWin,
+    SillyTavern: { chatId: 'flat-chat-1', chat: [{ is_user: false, mes: 'hello' }] },
+  };
+  globalThis.window = innerWin;
+  setRuntimeMode('tavern-helper');
+
+  const acu = detectAcuApi();
+  assert.equal(acu.available, true);
+  assert.equal(acu.sourceWindowLabel, 'window.top');
+  assert.equal(acu.capabilities.canRead, true);
+  assert.equal(acu.capabilities.canWrite, true);
+
+  const flatCtx = getSillyTavernContextSafe();
+  assert.equal(flatCtx?.chatId, 'flat-chat-1');
+
+  // 场景 B：AutoCardUpdaterAPI 仅挂在宿主同源子 frame（如兄弟脚本 iframe）
+  const hostNoApi = { document: {}, frames: [] };
+  hostNoApi.parent = hostNoApi;
+  hostNoApi.top = hostNoApi;
+  const siblingFrame = {
+    document: {},
+    AutoCardUpdaterAPI: { exportTableAsJson: () => makeRomanceAcuTables() },
+  };
+  hostNoApi.frames = [siblingFrame];
+  globalThis.window = hostNoApi;
+  setRuntimeMode('extension');
+  const acuSibling = detectAcuApi();
+  assert.equal(acuSibling.available, true);
+  assert.equal(acuSibling.sourceWindowLabel, 'frame[0]');
+
+  // 场景 C：严格跨域 sandbox，访问 parent.document 抛出 SecurityError → 绝不崩溃并如实记录拦截
+  const blockedParent = {};
+  Object.defineProperty(blockedParent, 'document', {
+    get() {
+      throw new Error('Blocked a frame with origin "null"');
+    },
+  });
+  const sandboxedWin = { document: {}, parent: blockedParent, top: blockedParent };
+  globalThis.window = sandboxedWin;
+  setRuntimeMode('tavern-helper');
+  const acuBlocked = detectAcuApi();
+  assert.equal(acuBlocked.available, false);
+  assert.equal(acuBlocked.scanMeta.parentAccessBlocked, true);
+
+  delete globalThis.window;
+  setRuntimeMode(null);
+});
+
+test('15. 四态探针与字符串/包装格式 exportTableAsJson 规范化解析', () => {
+  const classic = makeClassicAcuTables();
+  assert.equal(extractSheetsFromTableData(normalizeAcuTablePayload(JSON.stringify(classic))).length, 3);
+  assert.equal(extractSheetsFromTableData(normalizeAcuTablePayload({ tableSnapshot: classic })).length, 3);
+
+  // 状态 1：ready（支持 JSON 字符串返回值）
+  globalThis.window = {
+    AutoCardUpdaterAPI: {
+      exportTableAsJson: () => JSON.stringify(classic),
+      updateRow: async () => true,
+      insertRow: async () => 1,
+    },
+  };
+  const pReady = probeAcuStatusLight({ chat: [] });
+  assert.equal(pReady.status, 'ready');
+  assert.equal(pReady.ok, true);
+  assert.equal(pReady.sheetCount, 3);
+  assert.equal(pReady.canWrite, true);
+
+  // 状态 2：api_empty（接口存在但 CHAT_CHANGED 后尚未水合，exportTableAsJson 返回 {}）
+  globalThis.window = {
+    AutoCardUpdaterAPI: {
+      exportTableAsJson: () => ({}),
+      refreshDataAndWorldbook: async () => true,
+    },
+  };
+  const pEmpty = probeAcuStatusLight({ chat: [] });
+  assert.equal(pEmpty.status, 'api_empty');
+  assert.equal(pEmpty.apiAvailable, true);
+  assert.equal(pEmpty.ok, false);
+
+  // 状态 3：api_missing（完全无接口无楼层数据）
+  globalThis.window = {};
+  const pMissing = probeAcuStatusLight({ chat: [] });
+  assert.equal(pMissing.status, 'api_missing');
+  assert.equal(pMissing.apiAvailable, false);
+
+  delete globalThis.window;
+});
+
+test('16. 异步智能读取：遇到刚切聊天 ACU 返回空对象时自动触发 refreshDataAndWorldbook 恢复连接', async () => {
+  let hydrated = false;
+  let refreshCount = 0;
+  globalThis.window = {
+    AutoCardUpdaterAPI: {
+      exportTableAsJson: () => (hydrated ? makeRomanceAcuTables() : {}),
+      updateRow: async () => true,
+      insertRow: async () => 1,
+      refreshDataAndWorldbook: async () => {
+        refreshCount += 1;
+        hydrated = true;
+        return true;
+      },
+    },
+  };
+  const ctx = { chatId: 'new-chat', chat: [{ is_user: false, mes: '开场白' }] };
+
+  // 同步直读时确实是 api_empty
+  const syncRes = readCurrentChatAcuTables(ctx);
+  assert.equal(syncRes.ok, false);
+  assert.equal(syncRes.status, 'api_empty');
+
+  // 异步智能读取自动触发一次 refreshDataAndWorldbook 并成功读出可写表
+  const asyncRes = await readCurrentChatAcuTablesAsync(ctx, { triggerRefreshIfEmpty: true });
+  assert.equal(refreshCount, 1);
+  assert.equal(asyncRes.ok, true);
+  assert.equal(asyncRes.canWrite, true);
+  assert.equal(asyncRes.triggeredRefresh, true);
+  assert.equal(asyncRes.sheets.length, 1);
+
+  delete globalThis.window;
+});
+
+test('17. 聊天楼层 TavernDB_ACU_* 兜底提取（V2 storageFrame + 增量日志提示）支持只读导出但不冒充可写', () => {
+  const classic = makeClassicAcuTables();
+  const chatWithV2Frame = {
+    chatId: 'floor-only-chat',
+    chat: [
+      { is_user: false, mes: '开场白' },
+      {
+        is_user: false,
+        mes: '第二幕',
+        TavernDB_ACU_IsolatedData: JSON.stringify({
+          '': {
+            storageFrame: {
+              version: 2,
+              checkpoint: { kind: 'full', data: classic },
+              logEntries: [
+                { seq: 1, operations: [{ kind: 'sql_sheet_batch', sheetKey: 'sheet_DpKcVGqg', statements: ['UPDATE ...'] }] },
+              ],
+            },
+          },
+        }),
+      },
+    ],
+  };
+
+  globalThis.window = {};
+  const floorSnap = extractAcuTableDataFromChatFloors(chatWithV2Frame);
+  assert.equal(floorSnap.found, true);
+  assert.equal(floorSnap.sheetCount, 3);
+  assert.equal(floorSnap.hasIncrementalLogOps, true);
+
+  const probe = probeAcuStatusLight(chatWithV2Frame);
+  assert.equal(probe.status, 'floor_fallback');
+  assert.equal(probe.canExport, true);
+  assert.equal(probe.canWrite, false);
+
+  const readRes = readCurrentChatAcuTables(chatWithV2Frame);
+  assert.equal(readRes.ok, true);
+  assert.equal(readRes.canExport, true);
+  assert.equal(readRes.canWrite, false);
+  assert.equal(readRes.readOnlyFallback, true);
+  assert.equal(readRes.source, 'chat_floor_fallback');
+  assert.equal(readRes.sheets.length, 3);
+
+  delete globalThis.window;
+});
+
+test('18. 零隐私数据库检测诊断报告：识别疑似其他数据库全局键并输出中文结论', () => {
+  globalThis.window = {
+    __ACU_STAR_DB_III_LOADED__: false,
+    CustomMemoryTableAPI: { secretShouldNotAppear: 'TOP_SECRET_VALUE' },
+  };
+  const diag = collectAcuDiagnostics({
+    chatId: 'diag-chat',
+    characterId: 0,
+    characters: [{ name: '测试卡' }],
+    chat: [{ is_user: false, mes: '不应泄露的正文内容' }],
+  });
+  assert.equal(diag.acuApiFound, false);
+  assert.ok(diag.suspectedDbKeys.some(k => k.includes('CustomMemoryTableAPI')));
+
+  const text = formatAcuDiagnosticsText(diag);
+  assert.match(text, /CustomMemoryTableAPI/);
+  assert.doesNotMatch(text, /TOP_SECRET_VALUE/);
+  assert.doesNotMatch(text, /不应泄露的正文内容/);
+
+  delete globalThis.window;
 });
 
 

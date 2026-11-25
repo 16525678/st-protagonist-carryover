@@ -4,6 +4,26 @@
 
 ---
 
+## v0.5.0（2026-11-23）
+
+### 深度修复「已加载聊天仍提示未检测到数据库」问题与新增一键检测诊断
+- **修复切换聊天与启动时的异步水合竞态（核心原因）**：
+  - 龙血玄黄·数据库在启动时延迟 1000ms+、在 `CHAT_CHANGED` 切聊天时会先清空内存表再延迟 1200ms 异步回放；旧版只在切聊天瞬间（`t=0ms`）检查一次，导致页面始终卡在「未检测到」。
+  - 现已自动订阅 `AutoCardUpdaterAPI.registerTableUpdateCallback()`（并在切聊天后 1.6s / 3.5s 与启动阶段自动轮询补检），数据库一完成加载，设置抽屉与工作台立即自动刷新为「已连接」。
+- **四态精准区分 + 自动触发数据库刷新**：
+  - 不再把所有失败笼统写成「未检测到」，明确区分 4 种状态：`已连接 (N表)` / `接口已连·待加载表` / `仅楼层存档 (只读)` / `未发现接口`；
+  - 点击「从当前聊天数据库读取」或「刷新检测」时，若检测到 `AutoCardUpdaterAPI` 已存在但内存表暂为空，自动调用 `refreshDataAndWorldbook({ awaitFrontendReadback: false })` 触发数据库刷新并重读，同时支持 `exportTableSnapshotsAtMessages()` 历史快照与字符串/包装格式返回值兼容。
+- **多窗口安全穿透扫描 + 酒馆助手扁平上下文兼容**：
+  - 升级 `src/host-env.js`：沿 `window → parent → top` 链及宿主同源子 `frames` 安全扫描 `AutoCardUpdaterAPI`、`SillyTavern` 与 `__TAURITAVERN__`，全部跨窗口访问均做 `SecurityError` 隔离；
+  - 兼容酒馆助手 script iframe 内无 `.getContext()` 的扁平 `window.SillyTavern` 对象，并增加酒馆助手 `eventOn(tavern_events.CHAT_CHANGED)` 事件监听兜底与启动上下文短暂重试。
+- **聊天楼层 `TavernDB_ACU_*` 只读直读兜底**：
+  - 即使实时数据库接口暂未就绪，只要当前聊天楼层存在 `TavernDB_ACU_IsolatedData`（含 V2 `storageFrame` 与 V1 `independentData`）等字段，「1. 导出主角」仍可直接提取并导出主角档案（同时在「2. 写回数据库」诚实标注只读状态，不冒充可写回）。
+- **新增一键「🔍 检测诊断」面板**：
+  - 工作台与读表失败页内置零隐私泄露诊断报告（只采集窗口扫描状态、接口方法、返回值类型、楼层字段命中数与疑似数据库全局键名，绝不读取聊天正文或密钥），支持手机端一键「📋 复制诊断信息」与「🔄 触发数据库刷新并重读」。
+- 同步重新打包离线单文件 [酒馆助手脚本-主角跨聊天传承.json](./酒馆助手脚本-主角跨聊天传承.json)，离线单元测试扩展至 **18 项全部通过**。
+
+---
+
 ## v0.4.0（2026-11-23）
 
 ### 完整兼容「酒馆助手（Tavern Helper / JS-Slash-Runner）」

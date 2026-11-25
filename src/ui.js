@@ -23,10 +23,13 @@ import {
   parseImportedSourceJson,
 } from './schema-engine.js';
 import {
+  collectAcuDiagnostics,
   executeCompiledWritePlan,
+  formatAcuDiagnosticsText,
   getCurrentChatIdentity,
   probeAcuStatusLight,
   readCurrentChatAcuTables,
+  readCurrentChatAcuTablesAsync,
 } from './acu-adapter.js';
 import {
   applyChatPromptInjection,
@@ -98,15 +101,19 @@ function notifyToast(type, message) {
 }
 
 /** 创建可挂载、可清理的双端工作台控制器 */
-export function createWorkbenchController({ getContext }) {
+export function createWorkbenchController({ getContext, onBeforeOpen } = {}) {
   const state = {
     activeTab: 'export', // 'export' | 'inherit' | 'library'
     profiles: [],
     exportDraft: null,
     showPasteBox: false,
     pasteText: '',
+    showDiagnostics: false,
+    lastDiagnosticsText: '',
+    lastReadNotice: '',
     selectedProfileId: '',
     inheritMode: 'db', // 'db' | 'prompt'
+    userManuallyChosePrompt: false,
     targetReadResult: null,
     mappingPlan: null,
     alsoInjectOverflow: true,
@@ -226,24 +233,31 @@ export function createWorkbenchController({ getContext }) {
     };
   }
 
-  function refreshTargetContextForInherit({ resetMapping = false } = {}) {
+  function isWritableDbReady(readRes) {
+    return Boolean(readRes?.ok && readRes?.canWrite && Array.isArray(readRes.sheets) && readRes.sheets.length > 0);
+  }
+
+  function refreshTargetContextForInherit({ resetMapping = false, preloadedResult = null } = {}) {
     const ctx = getContext();
-    state.targetReadResult = readCurrentChatAcuTables(ctx);
+    state.targetReadResult = preloadedResult || readCurrentChatAcuTables(ctx);
     state.showAllOps = false;
     const profile = getSelectedProfile();
     const settings = getExtensionSettings(ctx);
     const identity = state.targetReadResult.identity;
     const binding = getChatBinding(ctx, identity.bindingKey);
+    const writableReady = isWritableDbReady(state.targetReadResult);
 
-    if (!state.targetReadResult.ok && state.inheritMode === 'db') {
+    if (!writableReady && state.inheritMode === 'db') {
       state.inheritMode = 'prompt';
+    } else if (writableReady && !state.userManuallyChosePrompt && state.inheritMode === 'prompt') {
+      state.inheritMode = 'db';
     }
 
-    if (profile && state.targetReadResult.ok) {
+    if (profile && writableReady) {
       if (resetMapping || !state.mappingPlan) {
         state.mappingPlan = buildDefaultMappingPlan(profile, state.targetReadResult.tableData);
       }
-    } else if (!state.targetReadResult.ok) {
+    } else if (!writableReady) {
       state.mappingPlan = null;
     }
 
@@ -262,7 +276,7 @@ export function createWorkbenchController({ getContext }) {
     }
   }
 
-  /** 刷新设置面板抽屉内的状态摘要（极轻量探针，零解析开销） */
+  /** 刷新设置面板抽屉内的状态摘要（极轻量四态探针，零解析开销） */
   function updateSettingsDrawerStatus() {
     const doc = getHostDocument();
     const drawer = doc?.getElementById(DRAWER_ID);
@@ -271,16 +285,23 @@ export function createWorkbenchController({ getContext }) {
     const identity = getCurrentChatIdentity(ctx);
     const binding = getChatBinding(ctx, identity.bindingKey);
     const injStatus = getActiveInjectionStatus();
-    const probe = probeAcuStatusLight();
+    const probe = probeAcuStatusLight(ctx);
     const runtime = getHostRuntimeSummary();
 
     const statusEl = drawer.querySelector('[data-pc-drawer-status]');
     const clearBtn = drawer.querySelector('[data-pc-drawer-clear]');
     if (!statusEl) return;
 
-    const dbText = probe.ok
-      ? `已检测到龙血玄黄数据库（${probe.sheetCount} 张表）`
-      : '当前聊天未检测到龙血玄黄数据库（可用导入 / 提示词注入）';
+    let dbText = '当前未发现龙血玄黄数据库接口（支持导入 JSON / 提示词注入）';
+    if (probe.status === 'ready') {
+      dbText = `已连接龙血玄黄数据库（${probe.sheetCount} 张表）`;
+    } else if (probe.status === 'api_empty') {
+      dbText = probe.hasFloorData
+        ? '已发现数据库接口，实时表待加载（楼层含存档，进工作台可一键刷新或导出）'
+        : '已发现数据库接口，当前聊天暂未加载表格（进工作台可点「触发刷新」）';
+    } else if (probe.status === 'floor_fallback') {
+      dbText = `未连实时接口，但在聊天楼层发现存档（${probe.sheetCount} 张表，可直接导出）`;
+    }
 
     const bindText = binding?.enabled
       ? `当前聊天已开启注入：<strong>${escapeHtml(binding.profileName || '未命名主角')}</strong>（${escapeHtml(getChannelDisplayName(injStatus.channel))}）`
@@ -382,6 +403,13 @@ export function createWorkbenchController({ getContext }) {
   }
 
   async function openWorkbench(initialTab) {
+    if (typeof onBeforeOpen === 'function') {
+      try {
+        onBeforeOpen();
+      } catch {
+        // ignore
+      }
+    }
     await refreshProfiles();
     if (initialTab) state.activeTab = initialTab;
     state.showPasteBox = false;
@@ -510,6 +538,28 @@ export function createWorkbenchController({ getContext }) {
           : renderLibraryTab();
 
     bodyEl.scrollTop = savedScrollTop;
+  }
+
+  function renderDiagnosticsBoxHtml() {
+    if (!state.showDiagnostics) return '';
+    const diag = collectAcuDiagnostics(getContext());
+    const diagText = formatAcuDiagnosticsText(diag);
+    state.lastDiagnosticsText = diagText;
+    const canForceRefresh = Boolean(diag.acuApiFound && diag.acuCapabilities?.canRefresh);
+    return `
+      <div class="pc-card pc-diag-card">
+        <div class="pc-paste-head">
+          <strong>🔍 数据库检测诊断（零隐私数据）</strong>
+          <button type="button" class="pc-link-btn" data-pc-toggle-diag>收起</button>
+        </div>
+        <div class="pc-diag-verdict">${escapeHtml(diag.verdict)}</div>
+        <pre class="pc-diag-pre">${escapeHtml(diagText)}</pre>
+        <div class="pc-toolbar-btns pc-mt-sm">
+          ${canForceRefresh ? `<button type="button" class="menu_button pc-btn-primary" data-pc-force-refresh-db>🔄 触发数据库刷新并重读</button>` : ''}
+          <button type="button" class="menu_button" data-pc-copy-diag>📋 复制诊断信息</button>
+        </div>
+      </div>
+    `;
   }
 
   function renderPasteImportBoxHtml() {
@@ -660,6 +710,9 @@ export function createWorkbenchController({ getContext }) {
 
   function renderExportTab() {
     const draft = state.exportDraft;
+    const noticeHtml = state.lastReadNotice
+      ? `<div class="pc-notice-banner">${escapeHtml(state.lastReadNotice)}</div>`
+      : '';
     const topBar = `
       <div class="pc-card pc-toolbar">
         <div class="pc-toolbar-info">
@@ -673,8 +726,11 @@ export function createWorkbenchController({ getContext }) {
             <input type="file" accept=".json,application/json" data-pc-upload-source hidden />
           </label>
           <button type="button" class="menu_button" data-pc-open-paste>📋 粘贴 JSON</button>
+          <button type="button" class="menu_button" data-pc-toggle-diag>🔍 检测诊断</button>
         </div>
       </div>
+      ${noticeHtml}
+      ${renderDiagnosticsBoxHtml()}
       ${renderPasteImportBoxHtml()}
     `;
 
@@ -841,12 +897,16 @@ export function createWorkbenchController({ getContext }) {
             <span>继承主角：</span>
             <select class="text_pole pc-grow" data-pc-select-profile>${profileOptions}</select>
           </label>
-          <button type="button" class="menu_button" data-pc-refresh-target>刷新检测</button>
+          <div class="pc-toolbar-btns">
+            <button type="button" class="menu_button" data-pc-refresh-target>刷新检测</button>
+            <button type="button" class="menu_button" data-pc-toggle-diag>🔍 诊断</button>
+          </div>
         </div>
         <div class="pc-status-meta" data-pc-inherit-status-meta>
           ${renderInheritStatusMetaHtml(identity, readRes, binding)}
         </div>
       </div>
+      ${renderDiagnosticsBoxHtml()}
     `;
 
     const modeSwitcher = `
@@ -869,9 +929,17 @@ export function createWorkbenchController({ getContext }) {
   }
 
   function renderInheritStatusMetaHtml(identity, readRes, binding) {
+    let dbBadgeHtml = '<b class="pc-warn">未发现接口</b>';
+    if (isWritableDbReady(readRes)) {
+      dbBadgeHtml = `<b class="pc-ok">已连接 (${readRes.sheets.length}表)</b>`;
+    } else if (readRes.status === 'api_empty' || readRes.status === 'api_empty_with_floor') {
+      dbBadgeHtml = '<b class="pc-warn">接口已连·待加载表</b>';
+    } else if (readRes.status === 'floor_fallback') {
+      dbBadgeHtml = `<b class="pc-warn">仅楼层存档 (${readRes.sheets.length}表·只读)</b>`;
+    }
     return `
       <span>聊天：<b>${escapeHtml(identity.displayLabel)}</b></span>
-      <span>数据库：${readRes.ok ? `<b class="pc-ok">已连接 (${readRes.sheets.length}表)</b>` : `<b class="pc-warn">未检测到</b>`}</span>
+      <span>数据库：${dbBadgeHtml}</span>
       <span>AI楼层：${readRes.floorState.hasAiFloor ? `<b class="pc-ok">${readRes.floorState.aiFloorCount}条</b>` : `<b class="pc-err">无开场白</b>`}</span>
       <span>注入：${binding?.enabled ? `<b class="pc-ok">已开 (${escapeHtml(binding.profileName || '')})</b>` : `<span class="pc-muted">未开</span>`}</span>
     `;
@@ -1094,12 +1162,17 @@ export function createWorkbenchController({ getContext }) {
   }
 
   function renderDbWritebackSection(profile, readRes) {
-    if (!readRes.ok) {
+    if (!isWritableDbReady(readRes)) {
+      const canForceRefresh = Boolean(readRes.acu?.available && readRes.acu?.capabilities?.canRefresh);
       return `
         <div class="pc-empty">
-          <p>${escapeHtml(readRes.reason)}</p>
+          <p>${escapeHtml(readRes.reason || '当前聊天实时数据库写入接口暂未就绪。')}</p>
           <p class="pc-muted">如果当前角色卡没用龙血玄黄数据库，直接切到「模式 B：纯提示词注入」即可！</p>
-          <button type="button" class="menu_button pc-btn-primary" data-pc-inherit-mode="prompt">切换到纯提示词注入</button>
+          <div class="pc-toolbar-btns" style="justify-content:center;">
+            ${canForceRefresh ? `<button type="button" class="menu_button pc-btn-primary" data-pc-force-refresh-db>🔄 触发数据库刷新并重读</button>` : ''}
+            <button type="button" class="menu_button ${canForceRefresh ? '' : 'pc-btn-primary'}" data-pc-inherit-mode="prompt">切换到纯提示词注入</button>
+            <button type="button" class="menu_button" data-pc-toggle-diag>🔍 查看检测诊断</button>
+          </div>
         </div>
       `;
     }
@@ -1144,7 +1217,7 @@ export function createWorkbenchController({ getContext }) {
     const bodyEl = getBodyEl();
     const host = bodyEl?.querySelector('[data-pc-preflight-host]');
     const profile = getSelectedProfile();
-    if (!host || !profile || !state.targetReadResult?.ok) return;
+    if (!host || !profile || !isWritableDbReady(state.targetReadResult)) return;
     host.innerHTML = renderPreflightSectionHtml(profile, state.targetReadResult);
   }
 
@@ -1318,15 +1391,81 @@ export function createWorkbenchController({ getContext }) {
       return;
     }
 
+    if (target.hasAttribute('data-pc-toggle-diag')) {
+      state.showDiagnostics = !state.showDiagnostics;
+      renderCurrentTab({ resetScroll: false });
+      return;
+    }
+
+    if (target.hasAttribute('data-pc-copy-diag')) {
+      const text = state.lastDiagnosticsText || formatAcuDiagnosticsText(collectAcuDiagnostics(getContext()));
+      const ok = await copyTextToClipboard(text);
+      notifyToast(ok ? 'success' : 'warning', ok ? '已复制数据库检测诊断信息到剪贴板！' : '复制失败，请长按诊断文本框手动全选复制。');
+      return;
+    }
+
+    if (target.hasAttribute('data-pc-force-refresh-db')) {
+      const origLabel = target.textContent;
+      target.disabled = true;
+      target.textContent = '正在刷新数据库…';
+      const readRes = await readCurrentChatAcuTablesAsync(getContext(), { triggerRefreshIfEmpty: true });
+      target.disabled = false;
+      target.textContent = origLabel;
+      updateSettingsDrawerStatus();
+
+      if (state.activeTab === 'export') {
+        if (readRes.ok && readRes.canExport) {
+          state.exportDraft = buildExportDraftFromSheets(readRes.sheets, readRes.identity.displayLabel);
+          state.lastReadNotice = readRes.readOnlyFallback ? readRes.reason : '';
+          state.showDiagnostics = false;
+          notifyToast('success', `刷新成功！已读取 ${readRes.sheets.length} 张表。`);
+        } else {
+          state.lastReadNotice = readRes.reason;
+          notifyToast('warning', readRes.reason);
+        }
+        renderCurrentTab({ resetScroll: false });
+        return;
+      }
+
+      state.lastWriteReceipt = null;
+      refreshTargetContextForInherit({ resetMapping: true, preloadedResult: readRes });
+      if (isWritableDbReady(readRes)) {
+        state.showDiagnostics = false;
+        notifyToast('success', `刷新成功！已连接数据库（${readRes.sheets.length} 张表）。`);
+      } else {
+        notifyToast('warning', readRes.reason || '仍未加载出可写表格，请查看诊断信息。');
+      }
+      renderCurrentTab({ resetScroll: false });
+      return;
+    }
+
     // Tab 1 buttons
     if (target.hasAttribute('data-pc-read-current')) {
-      const readRes = readCurrentChatAcuTables(getContext());
-      if (!readRes.ok) {
+      const origLabel = target.textContent;
+      target.disabled = true;
+      target.textContent = '正在读取…';
+      const readRes = await readCurrentChatAcuTablesAsync(getContext(), { triggerRefreshIfEmpty: true });
+      target.disabled = false;
+      target.textContent = origLabel;
+      updateSettingsDrawerStatus();
+
+      if (!readRes.ok || !readRes.canExport) {
+        state.lastReadNotice = readRes.reason;
+        state.showDiagnostics = true;
         notifyToast('warning', readRes.reason);
+        renderCurrentTab({ resetScroll: false });
         return;
       }
       state.exportDraft = buildExportDraftFromSheets(readRes.sheets, readRes.identity.displayLabel);
-      notifyToast('success', `已读取当前聊天数据库，共 ${readRes.sheets.length} 张表。`);
+      state.lastReadNotice = readRes.readOnlyFallback ? readRes.reason : '';
+      state.showDiagnostics = false;
+      const sourceNote =
+        readRes.source === 'chat_floor_fallback'
+          ? '（从聊天楼层记录提取）'
+          : readRes.triggeredRefresh
+            ? '（已自动刷新数据库）'
+            : '';
+      notifyToast('success', `已读取当前聊天数据库，共 ${readRes.sheets.length} 张表${sourceNote}。`);
       renderCurrentTab({ resetScroll: false });
       return;
     }
@@ -1408,16 +1547,31 @@ export function createWorkbenchController({ getContext }) {
 
     // Tab 2 buttons
     if (target.hasAttribute('data-pc-refresh-target')) {
+      const origLabel = target.textContent;
+      target.disabled = true;
+      target.textContent = '检测中…';
       state.lastWriteReceipt = null;
-      refreshTargetContextForInherit({ resetMapping: true });
+      const readRes = await readCurrentChatAcuTablesAsync(getContext(), { triggerRefreshIfEmpty: true });
+      target.disabled = false;
+      target.textContent = origLabel;
+      refreshTargetContextForInherit({ resetMapping: true, preloadedResult: readRes });
+      updateSettingsDrawerStatus();
+      if (isWritableDbReady(readRes)) {
+        notifyToast('success', `已检测到当前聊天数据库（${readRes.sheets.length} 张表）。`);
+      } else {
+        notifyToast('warning', readRes.reason || '当前聊天暂未检测到可写数据库。');
+      }
       renderCurrentTab({ resetScroll: false });
       return;
     }
 
     if (target.dataset.pcInheritMode) {
       state.inheritMode = target.dataset.pcInheritMode;
+      if (isWritableDbReady(state.targetReadResult)) {
+        state.userManuallyChosePrompt = state.inheritMode === 'prompt';
+      }
       const profile = getSelectedProfile();
-      if (state.inheritMode === 'db' && state.targetReadResult?.ok && !state.mappingPlan && profile) {
+      if (state.inheritMode === 'db' && isWritableDbReady(state.targetReadResult) && !state.mappingPlan && profile) {
         state.mappingPlan = buildDefaultMappingPlan(profile, state.targetReadResult.tableData);
       }
       const bodyEl = getBodyEl();
@@ -1445,7 +1599,7 @@ export function createWorkbenchController({ getContext }) {
     if (target.hasAttribute('data-pc-apply-overflow-only')) {
       const profile = getSelectedProfile();
       const ctx = getContext();
-      if (!profile || !state.targetReadResult?.ok) return;
+      if (!profile || !isWritableDbReady(state.targetReadResult)) return;
       const compiled = compileWritePlan(profile, state.targetReadResult.tableData, state.mappingPlan);
       applyOverflowBinding(ctx, profile, compiled.overflowText);
       notifyToast('success', `已将主角「${profile.name}」的补充传承信息注入当前聊天。`);
@@ -1457,7 +1611,7 @@ export function createWorkbenchController({ getContext }) {
     if (target.hasAttribute('data-pc-execute-db')) {
       const profile = getSelectedProfile();
       const ctx = getContext();
-      if (!profile || !state.targetReadResult?.ok || !state.mappingPlan) return;
+      if (!profile || !isWritableDbReady(state.targetReadResult) || !state.mappingPlan) return;
       target.disabled = true;
       target.textContent = '正在写入…';
       const compiled = compileWritePlan(profile, state.targetReadResult.tableData, state.mappingPlan);
@@ -1672,7 +1826,7 @@ export function createWorkbenchController({ getContext }) {
       const mIdx = Number(el.dataset.pcTargetSheet);
       const tblMap = state.mappingPlan?.tableMappings[mIdx];
       const profile = getSelectedProfile();
-      if (!tblMap || !profile || !state.targetReadResult?.ok) return;
+      if (!tblMap || !profile || !isWritableDbReady(state.targetReadResult)) return;
       const newKey = el.value || null;
       tblMap.targetSheetKey = newKey;
       const tgtSchema = state.targetReadResult.sheets.find(s => s.sheetKey === newKey) || null;
@@ -1871,11 +2025,32 @@ export function createWorkbenchController({ getContext }) {
     const identity = getCurrentChatIdentity(ctx);
     const binding = getChatBinding(ctx, identity.bindingKey);
     applyChatPromptInjection(ctx, binding, identity.bindingKey);
+    state.userManuallyChosePrompt = false;
     updateSettingsDrawerStatus();
     if (modalEl && state.activeTab === 'inherit') {
       state.lastWriteReceipt = null;
       refreshTargetContextForInherit({ resetMapping: true });
       renderCurrentTab({ resetScroll: true });
+    }
+  }
+
+  /** 当龙血玄黄数据库完成延迟水合或表更新回调触发时，无感同步抽屉与工作台状态 */
+  function onAcuTablesUpdated() {
+    updateSettingsDrawerStatus();
+    if (!modalEl) return;
+    if (state.activeTab === 'inherit') {
+      const prevWritable = isWritableDbReady(state.targetReadResult);
+      const fresh = readCurrentChatAcuTables(getContext());
+      const nextWritable = isWritableDbReady(fresh);
+      if (!prevWritable && nextWritable) {
+        refreshTargetContextForInherit({ resetMapping: true, preloadedResult: fresh });
+        renderCurrentTab({ resetScroll: false });
+      } else if (state.targetReadResult) {
+        state.targetReadResult = fresh;
+        patchInheritStatusMeta();
+      }
+    } else if (state.showDiagnostics) {
+      renderCurrentTab({ resetScroll: false });
     }
   }
 
@@ -1885,6 +2060,7 @@ export function createWorkbenchController({ getContext }) {
     openWorkbench,
     closeWorkbench,
     onChatChanged,
+    onAcuTablesUpdated,
     updateSettingsDrawerStatus,
   };
 }

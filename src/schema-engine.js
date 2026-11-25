@@ -554,7 +554,11 @@ export function parseImportedSourceJson(jsonText) {
 export function extractSheetsFromTableData(tableData) {
   if (!tableData || typeof tableData !== 'object') return [];
   const entries = Object.entries(tableData)
-    .filter(([key, val]) => key.startsWith('sheet_') && val && typeof val === 'object' && Array.isArray(val.content))
+    .filter(([key, val]) => {
+      if (key === 'mate' || !val || typeof val !== 'object' || !Array.isArray(val.content)) return false;
+      if (key.startsWith('sheet_')) return true;
+      return typeof val.name === 'string' && val.content.length > 0 && Array.isArray(val.content[0]);
+    })
     .sort(([, a], [, b]) => (Number(a.orderNo ?? 999) - Number(b.orderNo ?? 999)));
 
   return entries.map(([sheetKey, sheet]) => parseSheetSchema(sheetKey, sheet));

@@ -15,11 +15,13 @@ import {
   deepCloneSafe,
 } from './schema-engine.js';
 import {
+  collectCandidateWindows,
   detectRuntimeMode,
   getHostDocument,
   getHostWindow,
   getSillyTavernGlobal,
   getTavernHelperApi,
+  safeGetProp,
 } from './host-env.js';
 
 export const MODULE_NAME = 'st_protagonist_carryover';
@@ -36,20 +38,23 @@ const DEFAULT_SETTINGS = Object.freeze({
   defaultPromptRole: 'system',
 });
 
+function findTauriTavernGlobal() {
+  const { windows } = collectCandidateWindows();
+  for (const { win } of windows) {
+    const tt = safeGetProp(win, '__TAURITAVERN__');
+    if (tt && typeof tt === 'object') return tt;
+  }
+  return null;
+}
+
 /** 检测当前宿主是否为 TauriTavern（Rust + 系统 WebView） */
 export function isTauriTavernHost() {
-  try {
-    const win = getHostWindow();
-    return Boolean(globalThis.__TAURITAVERN__ || win?.__TAURITAVERN__);
-  } catch {
-    return false;
-  }
+  return Boolean(findTauriTavernGlobal());
 }
 
 function getTauriTavernStore() {
   try {
-    const win = getHostWindow();
-    const tt = win?.__TAURITAVERN__ || globalThis.__TAURITAVERN__;
+    const tt = findTauriTavernGlobal();
     const store = tt?.api?.extension?.store;
     if (store && typeof store.setJson === 'function' && typeof store.tryGetJson === 'function') {
       return store;
